@@ -1,0 +1,170 @@
+{
+  "project": "DocFlow",
+  "version": "0.1.0",
+  "last_updated": "2026-05-05",
+  "summary": "Lessons captured during initial build — Bulgarian Cyrillic invoice/protocol extraction system. Useful for future maintainers, code reviewers, and AI agents working on this codebase.",
+
+  "tool_selection": [
+    {
+      "id": "TS-1",
+      "title": "Vision-LLM beats generic OCR for structured documents",
+      "context": "First implementation used EasyOCR + img2table. Result on a real Bulgarian invoice: '3.998,00' came out as 'З.ggb', column boundaries broken, decimal separator dropped on 4,75 → 475.",
+      "lesson": "For invoices/forms, vision models like Gemini with Pydantic structured output produce near-perfect extraction directly into typed JSON. The model 'understands' the document semantics, not just pixels.",
+      "metric": "Gemini 2.5 Flash: ~$0.0003/invoice, free tier covers 20 req/day on this model. Math validation passed to the cent on 4 cross-checks.",
+      "anti_pattern": "Picking the lowest-friction local tool by default ('no API key, no sudo') rather than the right-fit tool for the document class."
+    },
+    {
+      "id": "TS-2",
+      "title": "Always present the full landscape of options",
+      "context": "Initially proposed only generic OCR and PDF-text tools. User flagged that DeepSeek-OCR, vision-LLMs, and specialized invoice APIs (Mindee, Rossum, Veryfi, Klippa, Affinda, Nanonets) were missing from the discussion.",
+      "lesson": "For document extraction tasks, four categories must be on the table from the start: (1) vision-LLMs with structured output, (2) modern open-source vision models, (3) specialized invoice APIs, (4) generic OCR + table detection. Generic OCR alone is the WEAKEST default for invoices."
+    }
+  ],
+
+  "architecture": [
+    {
+      "id": "ARCH-1",
+      "title": "Pipeline of fallback extractors, not single-tool choice",
+      "decision": "EXTRACTORS = [Gemini → pdfplumber → EasyOCR+img2table]. Each extractor declares can_handle(); pipeline tries them in order; falls through on exception.",
+      "rationale": "Documents come in many forms (born-digital PDF, scanned PDF, photo, tilted image). One extractor cannot serve all. System must degrade gracefully when primary fails (e.g. Gemini 503/quota)."
+    },
+    {
+      "id": "ARCH-2",
+      "title": "Per-client registry as compounding accuracy layer",
+      "decision": "SQLite-backed SupplierRegistry stores known supplier facts (name, address, EIK, VAT, IBAN, bank, BIC). enrich() applies registry over extraction; record() updates registry from extraction.",
+      "rationale": "OCR/LLM make different mistakes each run. A persistent registry of corrected facts means the same hallucination is auto-fixed silently on every subsequent run from that supplier. This is the Controlisy moat — the OCR engine is replaceable; the per-client memory is the differentiator.",
+      "trust_order": [
+        "Registry (highest — verified by past human review)",
+        "Gemini structured extraction (high — typed, semantic)",
+        "Regex on raw text (low — only safe patterns like IBAN with checksum, NEVER party identification)"
+      ]
+    },
+    {
+      "id": "ARCH-3",
+      "title": "Validation as last-line defense",
+      "decision": "Five-layer validation: (1) ЕИК format check, (2) IBAN length+checksum, (3) Σ line items = net amount, (4) subtotal − discount = net, (5) net + VAT = total + total − paid = remaining.",
+      "rationale": "OCR and LLMs both produce silently-wrong numbers. Math cross-checks catch the majority of digit-level errors regardless of which engine produced them. ЕИК/IBAN format checks catch transcription errors. Validation surfaces issues to a human review queue rather than letting bad data flow into accounting."
+    },
+    {
+      "id": "ARCH-4",
+      "title": "Conservative fallback parser",
+      "decision": "text_parser.py only extracts unambiguous fields (IBAN with checksum, labeled invoice number). Does NOT populate supplier/customer fields from regex.",
+      "rationale": "Distinguishing 'Изпълнител' vs 'Получател' from raw OCR text is unreliable across templates. Two attempts at heuristic parsing produced wrong supplier identification (MOL signature mistaken for supplier name; left-to-right OCR order mistaken for semantic order). Better to leave fields empty than fill them wrong."
+    }
+  ],
+
+  "bulgarian_domain_facts": [
+    {
+      "id": "BG-1",
+      "fact": "ЕИК can be 9 (legal entity), 10 (ЕГН — sole proprietor / natural person), or 13 (БУЛСТАТ) digits",
+      "implication": "All three lengths must validate as OK. Initial regex only accepted 9/13 — missed 10-digit suppliers like the EuroFaktura demo."
+    },
+    {
+      "id": "BG-2",
+      "fact": "ИН по ДДС (VAT number) is OPTIONAL — only present for VAT-registered entities",
+      "implication": "The Gemini prompt must NOT instruct 'always extract BG prefix' — non-VAT-registered suppliers have only ЕИК, no BG-prefixed VAT number. Hallucinating a BG number from ЕИК would be incorrect."
+    },
+    {
+      "id": "BG-3",
+      "fact": "Decimal separator is comma (1.999,00); thousands separator is dot or space (36.265,00 or 36 265,00)",
+      "implication": "Must be normalized to plain float internally. Output back to comma format only at presentation layer (Excel)."
+    },
+    {
+      "id": "BG-4",
+      "fact": "Standard VAT rates are 9% and 20%",
+      "implication": "VAT breakdown commonly has 1-2 entries. Schema models this as a list, not fixed pair."
+    },
+    {
+      "id": "BG-5",
+      "fact": "Чл. 117 (Article 117) protocols — self-charged VAT — are a Bulgarian-specific document class",
+      "implication": "Distinct from regular invoices in legal handling. Out of scope for v0.1 but noted for roadmap."
+    }
+  ],
+
+  "bugs_caught_during_build": [
+    {"id": 1, "severity": "critical", "description": "Registry empty when supplier had only VAT number, no separate ЕИК — record() returned early. Fix: derive ЕИК from BG-prefixed VAT digits."},
+    {"id": 2, "severity": "critical", "description": "IBAN regex matched VAT numbers as malformed IBANs (BG123456789 looks like a short IBAN). Fix: regex requires 4 letters after BG\\d{2}, matching real IBAN structure."},
+    {"id": 3, "severity": "minor", "description": "page_count hardcoded to 1 in Gemini and EasyOCR extractors. Fix: derive from PDF for born-digital."},
+    {"id": 4, "severity": "minor", "description": "Retry message showed '1/3' but actually had 4 attempts. Fix: total = retries + 1."},
+    {"id": 5, "severity": "minor", "description": "registry variable scope was inside `if doc.invoice` block, fragile if flow changed. Fix: always create registry."},
+    {"id": 6, "severity": "critical", "description": "ЕИК regex did not support 10-digit ЕГН (Bulgarian sole proprietors). Fix: accept 9, 10, or 13."},
+    {"id": 7, "severity": "critical", "description": "ЕИК regex matched invoice numbers (10 digits like '0000000321') as ЕИК. Fix: validate typed fields when InvoiceData present; require label (ЕИК/ПИК/BG) for text fallback."},
+    {"id": 8, "severity": "high", "description": "Per-client learning never engaged on fallback paths (pdfplumber, EasyOCR don't produce InvoiceData). Fix: text_parser fills minimal InvoiceData after extraction."},
+    {"id": 9, "severity": "critical", "description": "text_parser swapped supplier and customer (assigned first ЕИК as supplier based on text order). Fix: parser does NOT populate parties from regex."},
+    {"id": 10, "severity": "critical", "description": "text_parser captured МОЛ from signature line as supplier name. Same fix as #9."},
+    {"id": 11, "severity": "critical", "description": "registry.record() mutated input invoice by writing to inv.supplier.eik. Fix: do not mutate caller's object."},
+    {"id": 12, "severity": "critical", "description": "registry.enrich() mutated input BEFORE calling model_copy. Fix: model_copy(deep=True) FIRST, work on the copy."},
+    {"id": 13, "severity": "high", "description": "Registry never filled missing fields — `if known is None or seen is None: continue` skipped all None-known cases. Fix: when known is None and seen is non-None, AUTO-FILL via UPDATE."},
+    {"id": 14, "severity": "minor", "description": "Unused `import json` in registry.py."},
+    {"id": 15, "severity": "minor", "description": "`except (NoExtractorFound, Exception)` was redundant — Exception catches everything."},
+    {"id": 16, "severity": "high", "description": "gemini_extractor crashed if response.parsed was None (safety filter, malformed JSON). Fix: explicit None check with clear error message."},
+    {"id": 17, "severity": "high", "description": "IBAN in raw text was NOT validated when invoice existed but had no IBAN field — pure miss. Fix: text-fallback IBAN scan runs whenever invoice.iban is None."},
+    {"id": 18, "severity": "minor", "description": "Schema description on Party.eik still said '9 or 13 digit' after BG-1 was learned. Fix: update to '9, 10, or 13'."}
+  ],
+
+  "design_principles_emerged": [
+    "Don't pollute the registry with low-confidence data — better to learn nothing than to learn wrong.",
+    "Every extractor is replaceable; the canonical schema (InvoiceData) is the spine.",
+    "Validation is independent of extraction — math checks work on any number, no matter who produced it.",
+    "Trust hierarchy explicit: registry > typed extraction > regex on text. Never invert.",
+    "Cost-aware routing: free fast paths (pdfplumber for born-digital) before paid (Gemini), but Gemini ranked first for invoices because the structured output saves work downstream.",
+    "Fallback gracefully on failure (503/quota), surface the degradation in extraction_method field of output."
+  ],
+
+  "open_questions": [
+    "Multi-page invoices: tested only single-page so far. Schema and pipeline support multi-page, but no real sample yet.",
+    "Чл. 117 protocols: prompt mentions them but no validation rules specific to self-charged VAT."
+  ],
+
+  "real_world_batch_findings_2026_05_10": {
+    "context": "First real-world batch on 20 diverse Bulgarian invoices from 17+ suppliers (АЖД, Агритоп, Албис, Алфа Комерс, Биохем, Вероникс, ВиК Габрово, Виваком, ГВ Агри, Грейнстор, Д.Д.Д, Дисиком, Еконт, Електрохолд, Елмикс, ЗП Цветан Стефанов, Иванов 13, Манев 09, Ненко Трифонов).",
+    "results": {
+      "total": 20,
+      "via_gemini_flash_lite": 17,
+      "via_pdfplumber_fallback": 2,
+      "via_scanned_pdf_fallback": 1,
+      "with_typed_supplier_data": 17,
+      "line_items_extracted": 52,
+      "vat_records_extracted": 15,
+      "validation_problems": 5
+    },
+    "real_problems_found": [
+      {
+        "problem": "Gemini hallucinates IBAN letters (~3 of 17 = ~18% error rate)",
+        "examples": ["Виваком", "Елмикс", "ЗП Цветан Стефанов"],
+        "detection": "IBAN mod-97 checksum validator catches all instances",
+        "fix": "Pipeline cross-checks Gemini IBAN against text_parser regex match. If Gemini IBAN fails checksum and text_parser finds a valid one, prefer text_parser's. Otherwise keep Gemini's value with the warning surfaced."
+      },
+      {
+        "problem": "Gemini sometimes doubles line items by including sub-totals as separate rows",
+        "example": "Виваком: Σ редове (74.44) ≠ нетна (37.22), разлика +37.22 (exactly the line total again — sub-item duplication)",
+        "detection": "math_lines_eq_net validator catches the imbalance",
+        "fix": "Surfaces as validation error, flags for human review. Auto-fix risky — sub-items can be legitimate detail rows in some templates."
+      },
+      {
+        "problem": "Gemini occasionally truncates invoice numbers",
+        "example": "Биохем 06.08.25.pdf: extracted 'Номер: 146' which looks like a partial",
+        "detection": "Manual review by user — no automated check (real invoice numbers can be 3-digit too)",
+        "fix": "Cannot auto-fix without re-extracting. Note in user-facing report when number is suspiciously short (<6 chars)."
+      },
+      {
+        "problem": "Some born-digital PDFs (Д.Д.Д, Дисиком) with text layer fall through to pdfplumber path",
+        "cause": "Gemini occasionally returns 503 even after retries. With env var GEMINI_RETRY_DELAYS=5,15, two retries allow recovery for transient cases but not for sustained server load.",
+        "detection": "extraction_method column in summary shows 'pdfplumber' instead of 'gemini:...'",
+        "fix": "Re-run only the affected files with paid Gemini tier (no quota throttling) for production-grade completeness."
+      }
+    ],
+    "performance_metrics": {
+      "throughput": "20 files in ~3 minutes with mostly Gemini path (~9 sec per Gemini call avg)",
+      "cost_estimate_paid_tier": "20 files * $0.0003 = $0.006 (less than 1 cent)"
+    },
+    "lessons_extracted": [
+      "Validation layer is the single most important component — caught EVERY real error (5 issues across 20 files), no false positives, no silent failures.",
+      "IBAN hallucination is the dominant Gemini failure mode (more than supplier/customer mix-ups, more than digit errors). Post-processing IBAN cross-check should be standard.",
+      "Math validation is more powerful than format validation — caught 2 multi-cent errors that no field-level check could detect.",
+      "Bug 24 (env loading timing) was a $0.30 lesson — the first 247-file batch used wrong (tighter-quota) model. Always read env-driven config lazily, not at __init__ time.",
+      "Bug 25 (Excel writer ignored tables when invoice present) was a 240-file data loss — when text_parser provides sparse InvoiceData, the original tables MUST also be written. Now: writer keeps both.",
+      "Free-tier flash-lite (1500/day) handles 247 invoices easily within quota IF retries are bounded (GEMINI_RETRY_DELAYS=5,15 works well — total 20s overhead per failed call vs 52s with old defaults)."
+    ]
+  }
+}
