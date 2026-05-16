@@ -34,17 +34,48 @@ COLUMN_CATALOG = [
     ("delivery_date",    "Дата доставка",      "Дати",       False),
     ("due_date",         "Срок плащане",       "Дати",       False),
 
-    ("currency",         "Валута",             "Плащане",    False),
+    ("currency",         "Валута",             "Плащане",    True),
     ("subtotal",         "Сума без отстъпка",  "Плащане",    False),
     ("discount",         "Отстъпка",           "Плащане",    False),
     ("payment_method",   "Метод плащане",      "Плащане",    False),
     ("paid",             "Платени",            "Плащане",    False),
     ("remaining",        "Остава",             "Плащане",    False),
+
+    ("quality_score",     "Quality score",      "Диагностика", True),
+    ("validation_errors", "Validation errors",  "Диагностика", True),
+    ("registry_status",   "Registry status",    "Диагностика", True),
+    ("is_derived",        "Има производни",     "Диагностика", True),
 ]
 
 
-def get_row_value(field: str, doc):
-    """Map a column key to the actual value from ExtractedDocument."""
+def get_row_value(field, doc, *, validation_findings=None, registry_findings=None):
+    """Map a column key to the actual value from ExtractedDocument.
+
+    Diagnostic columns (quality_score / validation_errors / registry_status /
+    is_derived) need additional context, passed as keyword arguments. When
+    those are omitted, diagnostic keys fall back to a sensible empty value.
+    """
+    if field == "quality_score":
+        return round(doc.quality_score, 2) if doc is not None else ""
+    if field == "validation_errors":
+        if not validation_findings:
+            return ""
+        codes = sorted({f.code for f in validation_findings if getattr(f, "level", None) == "error"})
+        return ", ".join(codes)
+    if field == "registry_status":
+        if not registry_findings:
+            return "—"
+        codes = [getattr(f, "code", "") for f in registry_findings]
+        if any(c == "registry_skipped" for c in codes):
+            return "не потвърден"
+        if any(c.startswith("supplier_") for c in codes):
+            return "записан"
+        return "—"
+    if field == "is_derived":
+        if doc is None or doc.invoice is None:
+            return ""
+        return "да" if doc.invoice.derived_fields else "не"
+
     if doc is None or doc.invoice is None:
         return ""
     inv = doc.invoice

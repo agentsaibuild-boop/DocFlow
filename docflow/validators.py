@@ -149,6 +149,26 @@ def validate_invoice_math(inv: InvoiceData) -> list[ValidationFinding]:
     return findings
 
 
+def _validate_bank_payment_iban(inv: InvoiceData) -> list[ValidationFinding]:
+    """Document-level fact: if the invoice explicitly says bank payment but no
+    IBAN was extracted, that's an error regardless of column selection.
+
+    This intentionally fires only on explicit bank payment hints — implicit/
+    unknown payment methods do not punish missing IBAN.
+    """
+    from docflow.status import requires_iban  # local import to avoid cycle
+
+    if not requires_iban(inv):
+        return []
+    if inv.iban:
+        return []
+    return [ValidationFinding(
+        level="error",
+        code="iban_missing_for_bank_payment",
+        message=f"Платежният метод '{inv.payment_method}' изисква IBAN, но няма извлечен",
+    )]
+
+
 def validate(doc: ExtractedDocument) -> list[ValidationFinding]:
     findings: list[ValidationFinding] = []
     text = doc.full_text + "\n" + "\n".join(
@@ -165,6 +185,7 @@ def validate(doc: ExtractedDocument) -> list[ValidationFinding]:
         else:
             findings.extend(validate_ibans_in_text(text))
         findings.extend(validate_invoice_math(doc.invoice))
+        findings.extend(_validate_bank_payment_iban(doc.invoice))
     else:
         findings.extend(validate_eiks_in_text(text))
         findings.extend(validate_ibans_in_text(text))

@@ -290,6 +290,255 @@ def test_derived_fields_provenance_still_records():
     return f"derived: {paths}"
 
 
+# 4ab. Supplier-aware status rules
+def _make_doc(inv):
+    from docflow.schema import ExtractedDocument
+    return ExtractedDocument(
+        source_path="x.pdf", extraction_method="test", page_count=1, invoice=inv,
+    )
+
+
+def test_foreign_supplier_no_iban_not_incomplete():
+    """GitHub/Canva/etc. — no BG identifiers, USD currency, no IBAN. Status
+    must NOT be INCOMPLETE because of the missing IBAN."""
+    from docflow.schema import InvoiceData, Party
+    from docflow.status import (
+        SupplierOrigin, compute_status, requires_iban, supplier_origin,
+    )
+
+    inv = InvoiceData(
+        invoice_number="INV-001",
+        issue_date="2026-01-01",
+        supplier=Party(name="GitHub, Inc."),
+        customer=Party(name="ПЕТЪР КОЗАРЕВ ЕООД", eik="201730367"),
+        net_amount=10.0,
+        total_to_pay=10.0,
+        currency="USD",
+    )
+    # No VAT, no EIK → origin is UNKNOWN (honest), not falsely "foreign".
+    assert supplier_origin(inv) == SupplierOrigin.UNKNOWN
+    assert not requires_iban(inv), "unknown-origin + no payment_method → IBAN not required"
+
+    required = [
+        "supplier_name", "supplier_iban", "invoice_number", "invoice_date",
+        "net_amount", "total_to_pay", "currency",
+    ]
+    result = compute_status(_make_doc(inv), [], required_column_keys=required)
+    assert result.code == "OK", f"expected OK, got {result.code}: {result.notes}"
+    assert "supplier_iban" not in result.empty_columns
+
+    # Now with explicit foreign VAT prefix — same conclusion via a different path.
+    inv_foreign = inv.model_copy(update={"supplier": Party(name="Canva Pty Ltd", vat_number="GB123456789")})
+    assert supplier_origin(inv_foreign) == SupplierOrigin.FOREIGN
+    result_foreign = compute_status(_make_doc(inv_foreign), [], required_column_keys=required)
+    assert result_foreign.code == "OK"
+    return result.notes
+
+
+def test_bg_supplier_no_iban_incomplete_with_bank_payment():
+    """Bulgarian supplier paying by bank transfer must carry an IBAN; status
+    is INCOMPLETE if IBAN is missing. Without an explicit bank payment
+    method, the conservative rule does NOT require IBAN — cash/card invoices
+    that omit payment_method must not be punished."""
+    from docflow.schema import InvoiceData, Party
+    from docflow.status import (
+        SupplierOrigin, compute_status, requires_iban, supplier_origin,
+    )
+
+    inv = InvoiceData(
+        invoice_number="100",
+        issue_date="2026-01-01",
+        supplier=Party(name="БГ ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="X"),
+        net_amount=100.0,
+        total_to_pay=120.0,
+        payment_method="ПЛАЩАНЕ ПО БАНКА",
+        currency="BGN",
+    )
+    assert supplier_origin(inv) == SupplierOrigin.BG
+    assert requires_iban(inv), "BG supplier + explicit bank payment → IBAN required"
+
+    required = ["supplier_name", "supplier_iban", "invoice_number", "invoice_date", "net_amount", "total_to_pay"]
+    result = compute_status(_make_doc(inv), [], required_column_keys=required)
+    assert result.code == "INCOMPLETE", f"expected INCOMPLETE, got {result.code}"
+    assert "supplier_iban" in result.empty_columns, result.empty_columns
+
+    # Same supplier without explicit payment_method — under the conservative
+    # rule, IBAN is NOT required (cash/card-paid BG invoices are common).
+    inv_default = inv.model_copy(update={"payment_method": None})
+    assert not requires_iban(inv_default), "no payment_method → no IBAN requirement"
+    result2 = compute_status(_make_doc(inv_default), [], required_column_keys=required)
+    assert result2.code == "OK", f"expected OK (no PM stated), got {result2.code}"
+
+    # Card-paid — IBAN exempt, status OK.
+    inv_card = inv.model_copy(update={"payment_method": "Кредитна карта"})
+    assert not requires_iban(inv_card)
+    result3 = compute_status(_make_doc(inv_card), [], required_column_keys=required)
+    assert result3.code == "OK"
+
+    return f"bank→INCOMPLETE, default→OK, card→OK"
+
+
+def test_math_mismatch_always_produces_error():
+    """A math validation error must surface as VALIDATION_ERROR regardless
+    of completeness or other signals."""
+    from docflow.schema import InvoiceData, LineItem, Party, VatBreakdown
+    from docflow.status import compute_status
+    from docflow.validators import validate_invoice_math
+
+    inv = InvoiceData(
+        invoice_number="X",
+        issue_date="2026-01-01",
+        supplier=Party(name="БГ ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="Y"),
+        iban="BG80BNBG96611020345678",
+        line_items=[LineItem(total_without_vat=100)],
+        net_amount=100.0,
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=100, vat_amount=20)],
+        total_to_pay=200.0,  # WRONG: should be 120
+        currency="BGN",
+        payment_method="По банка",
+    )
+    findings = validate_invoice_math(inv)
+    error_findings = [f for f in findings if f.level == "error"]
+    assert error_findings, "math validator should flag total_to_pay mismatch"
+
+    # Even though completeness is satisfied (IBAN present, BG bank payment),
+    # math error must dominate.
+    required = ["supplier_name", "supplier_iban", "invoice_number", "invoice_date", "net_amount", "total_to_pay"]
+    result = compute_status(_make_doc(inv), findings, required_column_keys=required)
+    assert result.code == "VALIDATION_ERROR", f"got {result.code}"
+    assert "math" in result.notes.lower(), result.notes
+    return f"math error → {result.code}: {result.notes}"
+
+
+def test_reject_criteria_end_to_end_xlsx():
+    """End-to-end acceptance: build the three reject-criteria scenarios as real
+    InvoiceData, run them through write_consolidated → reload xlsx → assert
+    the rejected combinations do NOT appear in the Фактури sheet.
+
+    Reject criteria (from user spec):
+      A. Math mismatch → must NOT be ✅ OK.
+      B. Foreign/unknown supplier without IBAN → must NOT be ⚠️ Непълни (N) due to IBAN.
+      C. BG supplier with explicit bank payment, no IBAN → must NOT be ✅ OK.
+
+    Synthetic but exercises the real export path (status engine → write_consolidated → xlsx).
+    """
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from openpyxl import load_workbook
+
+    from docflow.batch import BatchResult, write_consolidated
+    from docflow.schema import (
+        ExtractedDocument, InvoiceData, LineItem, Party, VatBreakdown,
+    )
+    from docflow.validators import validate
+
+    # Scenario A: math mismatch (total ≠ net + vat).
+    inv_math = InvoiceData(
+        invoice_number="A-MATH-001",
+        issue_date="2026-01-01",
+        supplier=Party(name="БГ Доставчик ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="Клиент"),
+        iban="BG80BNBG96611020345678",
+        line_items=[LineItem(total_without_vat=100)],
+        net_amount=100.0,
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=100, vat_amount=20)],
+        total_to_pay=200.0,  # ✗ should be 120
+        currency="BGN",
+        payment_method="По банка",
+    )
+
+    # Scenario B: GitHub-style foreign invoice — no BG identifiers, no IBAN, USD.
+    inv_github = InvoiceData(
+        invoice_number="B-GH-001",
+        issue_date="2026-02-01",
+        supplier=Party(name="GitHub, Inc."),
+        customer=Party(name="Клиент"),
+        net_amount=10.0,
+        total_to_pay=10.0,
+        currency="USD",
+    )
+
+    # Scenario C: BG supplier, explicit bank payment, no IBAN.
+    inv_bg_bank = InvoiceData(
+        invoice_number="C-BG-BANK-001",
+        issue_date="2026-03-01",
+        supplier=Party(name="БГ Доставчик ООД", eik="987654321", vat_number="BG987654321"),
+        customer=Party(name="Клиент"),
+        net_amount=100.0,
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=100, vat_amount=20)],
+        total_to_pay=120.0,
+        currency="BGN",
+        payment_method="ПЛАЩАНЕ ПО БАНКА",
+        # iban deliberately missing
+    )
+
+    results: list[BatchResult] = []
+    for name, inv in [
+        ("A_math.pdf", inv_math),
+        ("B_github.pdf", inv_github),
+        ("C_bg_bank_no_iban.pdf", inv_bg_bank),
+    ]:
+        doc = ExtractedDocument(
+            source_path=name, extraction_method="fixture", page_count=1, invoice=inv,
+        )
+        v = validate(doc)
+        results.append(BatchResult(_Path(name), None, doc, None, [], v, []))
+
+    with _tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+        out = _Path(tf.name)
+    try:
+        write_consolidated(results, out)
+        wb = load_workbook(out)
+        ws = wb["Фактури"]
+        # Build {filename: {column: value}} from sheet.
+        headers = [c.value for c in ws[1]]
+        rows = {}
+        for r in ws.iter_rows(min_row=2, values_only=True):
+            row = dict(zip(headers, r))
+            rows[row["Файл"]] = row
+
+        # A: math mismatch → status must contain "грешки"/"error" (NOT plain OK).
+        st_a = rows["A_math.pdf"]["Статус"]
+        assert "OK" not in st_a or "грешки" in st_a, f"REJECT: math mismatch marked OK: {st_a!r}"
+        assert "грешки" in st_a, f"REJECT: math mismatch did not surface as validation error: {st_a!r}"
+
+        # B: GitHub-style → no IBAN must not produce INCOMPLETE.
+        st_b = rows["B_github.pdf"]["Статус"]
+        assert "Непълни" not in st_b, f"REJECT: foreign/unknown invoice flagged INCOMPLETE: {st_b!r}"
+
+        # C: BG + bank + no IBAN → must NOT be OK.
+        st_c = rows["C_bg_bank_no_iban.pdf"]["Статус"]
+        assert "OK" not in st_c, f"REJECT: BG bank-paid invoice without IBAN marked OK: {st_c!r}"
+
+        return f"A={st_a}, B={st_b}, C={st_c}"
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def test_diagnostic_keys_never_gate_status():
+    """Selecting diagnostic columns (quality_score, validation_errors,
+    registry_status, is_derived) must not cause INCOMPLETE — they aren't
+    extracted data."""
+    from docflow.schema import InvoiceData, Party
+    from docflow.status import compute_status, DIAGNOSTIC_KEYS
+
+    inv = InvoiceData(
+        invoice_number="X", issue_date="2026-01-01",
+        supplier=Party(name="БГ ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="Y"),
+        iban="BG80BNBG96611020345678",
+        net_amount=100.0, total_to_pay=120.0,
+        currency="BGN", payment_method="По банка",
+    )
+    required = ["supplier_name"] + sorted(DIAGNOSTIC_KEYS)
+    result = compute_status(_make_doc(inv), [], required_column_keys=required)
+    assert result.code == "OK", f"diagnostic-only required keys should not affect status, got {result.code}"
+    return f"diagnostic keys ignored: {sorted(DIAGNOSTIC_KEYS)}"
+
+
 # 4b. Currency contract
 def test_currency_default_is_none():
     from docflow.schema import InvoiceData
@@ -595,6 +844,11 @@ TESTS: list[tuple[str, Callable]] = [
     ("registry: enrich replaces hallucinated IBAN", test_registry_enrich_overrides_mismatch),
     ("provenance: derived_fields not in JSON schema", test_derived_fields_not_in_json_schema),
     ("provenance: derivation still records via PrivateAttr", test_derived_fields_provenance_still_records),
+    ("status: foreign supplier without IBAN is not INCOMPLETE", test_foreign_supplier_no_iban_not_incomplete),
+    ("status: BG supplier with bank payment + no IBAN is INCOMPLETE", test_bg_supplier_no_iban_incomplete_with_bank_payment),
+    ("status: math mismatch always produces VALIDATION_ERROR", test_math_mismatch_always_produces_error),
+    ("acceptance: 3 reject-criteria scenarios through real xlsx export", test_reject_criteria_end_to_end_xlsx),
+    ("status: diagnostic columns never gate status", test_diagnostic_keys_never_gate_status),
     ("currency: schema default is None", test_currency_default_is_none),
     ("currency: quality score awards only for explicit currency", test_currency_quality_not_awarded_for_default),
     ("currency: display falls back to EUR when not extracted", test_currency_display_falls_back_to_EUR),

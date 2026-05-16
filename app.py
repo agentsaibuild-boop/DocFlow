@@ -271,7 +271,11 @@ with tab_results:
                 row["Метод"] = doc.extraction_method.replace("gemini:", "").replace(":claude-sonnet-4-6", "")
 
                 for col in selected:
-                    row[label_for[col]] = get_row_value(col, doc)
+                    row[label_for[col]] = get_row_value(
+                        col, doc,
+                        validation_findings=r.validation_findings,
+                        registry_findings=r.registry_findings,
+                    )
 
                 status = compute_status(
                     doc,
@@ -283,7 +287,7 @@ with tab_results:
                     empty_labels = [label_for[k] for k in status.empty_columns]
                     row["Бележки"] = "Празни: " + ", ".join(empty_labels)
                 else:
-                    row["Бележки"] = ""
+                    row["Бележки"] = status.notes
             rows.append(row)
 
         df = pd.DataFrame(rows)
