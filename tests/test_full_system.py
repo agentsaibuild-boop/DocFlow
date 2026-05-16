@@ -82,7 +82,7 @@ def test_pipeline_registers_extractors():
     from docflow.pipeline import EXTRACTORS
     names = [e.name for e in EXTRACTORS]
     assert names[0] == "pdfplumber", f"first should be pdfplumber, got {names[0]}"
-    assert "groq" in names and "claude" in names and "gemini" in names, names
+    assert "claude" in names and "gemini" in names, names
     return f"order: {names}"
 
 
@@ -249,6 +249,45 @@ def test_registry_enrich_overrides_mismatch():
     assert overrides, f"expected registry_override, got: {[f.code for f in findings]}"
     assert enriched.iban == "BG80BNBG96611020345678"
     return f"hallucinated IBAN replaced from registry"
+
+
+# 4a. Provenance metadata (PrivateAttr — must not leak into LLM schemas)
+def test_derived_fields_not_in_json_schema():
+    """Regression guard: provenance metadata is internal-only. If it leaks
+    into InvoiceData.model_json_schema(), Gemini/Claude/Mistral break with
+    schema validation errors (uniqueItems extra_forbidden)."""
+    from docflow.schema import InvoiceData
+    schema = InvoiceData.model_json_schema()
+    props = schema.get("properties", {})
+    assert "derived_fields" not in props, (
+        f"derived_fields leaked into JSON schema. Properties: {sorted(props)}"
+    )
+    assert "_derived_fields" not in props
+    return f"schema properties: {len(props)} fields, no provenance leak"
+
+
+def test_derived_fields_provenance_still_records():
+    """Pipeline normalization must still record what it filled, after the
+    PrivateAttr refactor."""
+    from docflow.pipeline import _derive_missing_totals
+    from docflow.schema import InvoiceData, LineItem, VatBreakdown
+
+    inv = InvoiceData(
+        line_items=[LineItem(number=1, description="X", total_without_vat=2500)],
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=2500, vat_amount=500)],
+    )
+    assert inv.net_amount is None and inv.total_to_pay is None
+    _derive_missing_totals(inv)
+
+    assert inv.net_amount == 2500
+    assert inv.total_to_pay == 3000
+    assert inv.is_derived("net_amount"), "net_amount should be marked derived"
+    assert inv.is_derived("total_to_pay"), "total_to_pay should be marked derived"
+    assert inv.is_derived("line_items[0].vat_amount"), "line vat should be marked derived"
+
+    paths = inv.derived_fields  # public property
+    assert isinstance(paths, tuple) and paths == tuple(sorted(paths))
+    return f"derived: {paths}"
 
 
 # 4b. Currency contract
@@ -554,6 +593,8 @@ TESTS: list[tuple[str, Callable]] = [
     ("registry: record/enrich do not mutate input", test_registry_does_not_mutate_input),
     ("registry: auto-fill missing fields on subsequent invoice", test_registry_auto_fills_missing_fields),
     ("registry: enrich replaces hallucinated IBAN", test_registry_enrich_overrides_mismatch),
+    ("provenance: derived_fields not in JSON schema", test_derived_fields_not_in_json_schema),
+    ("provenance: derivation still records via PrivateAttr", test_derived_fields_provenance_still_records),
     ("currency: schema default is None", test_currency_default_is_none),
     ("currency: quality score awards only for explicit currency", test_currency_quality_not_awarded_for_default),
     ("currency: display falls back to EUR when not extracted", test_currency_display_falls_back_to_EUR),

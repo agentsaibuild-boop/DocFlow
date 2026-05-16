@@ -4,9 +4,7 @@ from docflow.extractors import Extractor
 from docflow.extractors.azure_extractor import AzureExtractor
 from docflow.extractors.claude_extractor import ClaudeExtractor
 from docflow.extractors.gemini_extractor import GeminiExtractor
-from docflow.extractors.groq_extractor import GroqExtractor
 from docflow.extractors.mistral_extractor import MistralExtractor
-from docflow.extractors.openrouter_extractor import OpenRouterExtractor
 from docflow.extractors.pdfplumber_extractor import PdfplumberExtractor
 from docflow.quality import invoice_quality_score
 from docflow.schema import ExtractedDocument, is_useful_invoice
@@ -20,19 +18,15 @@ _text_llm = TextLLMExtractor()
 
 EXTRACTORS: list[Extractor] = [
     PdfplumberExtractor(),  # 1st: born-digital PDF (free, exact text → text_llm)
-    OpenRouterExtractor(),  # 2nd: unified gateway to all top LLMs (configurable model)
-    GroqExtractor(),        # 3rd: LPU-accelerated, very fast Llama 4 vision
-    AzureExtractor(),       # 4th: invoice-specialized model, per-field confidence
-    MistralExtractor(),     # 5th: Mistral OCR markdown → text_llm
-    ClaudeExtractor(),      # 6th: Claude vision
-    GeminiExtractor(),      # 7th: Gemini default (model from GEMINI_MODEL env)
+    AzureExtractor(),       # 2nd: invoice-specialized model, per-field confidence
+    MistralExtractor(),     # 3rd: Mistral OCR markdown → text_llm
+    ClaudeExtractor(),      # 4th: Claude vision
+    GeminiExtractor(),      # 5th: Gemini default (model from GEMINI_MODEL env)
     GeminiExtractor(model="gemini-3.1-flash-lite", name="gemini_3.1_flash_lite"),
     GeminiExtractor(model="gemini-2.5-pro", name="gemini_2.5_pro"),
 ]
 
 PROVIDER_ALIASES = {
-    "openrouter": "openrouter",
-    "groq": "groq",
     "azure": "azure_di_invoice",
     "pdfplumber": "pdfplumber",
     "mistral": "mistral_ocr",
@@ -150,8 +144,8 @@ def _derive_missing_totals(inv) -> None:
 
     Models often populate only one of these representations. We propagate so every
     output sheet (Фактури / Артикули / ДДС) shows consistent numbers. Anything
-    we fill in here is recorded on inv.derived_fields so downstream consumers can
-    distinguish extracted vs. computed values.
+    we fill in here is recorded via inv.mark_derived(path) so downstream
+    consumers can distinguish extracted vs. computed values.
     """
     _fill_line_item_arithmetic(inv)
     _propagate_single_vat_rate(inv)
@@ -173,19 +167,19 @@ def _derive_missing_totals(inv) -> None:
         filled = vat_base if vat_base is not None else items_net
         if filled is not None:
             inv.net_amount = filled
-            inv.derived_fields.add("net_amount")
+            inv.mark_derived("net_amount")
 
     if inv.total_to_pay is None and inv.net_amount is not None and vat_tax is not None:
         inv.total_to_pay = round(inv.net_amount + vat_tax, 2)
-        inv.derived_fields.add("total_to_pay")
+        inv.mark_derived("total_to_pay")
 
     if inv.total_to_pay is None and inv.net_amount is not None and not inv.vat_breakdown:
         inv.total_to_pay = inv.net_amount
-        inv.derived_fields.add("total_to_pay")
+        inv.mark_derived("total_to_pay")
 
     if inv.net_amount is None and inv.total_to_pay is not None and vat_tax is not None:
         inv.net_amount = round(inv.total_to_pay - vat_tax, 2)
-        inv.derived_fields.add("net_amount")
+        inv.mark_derived("net_amount")
 
 
 def _fill_line_item_arithmetic(inv) -> None:
@@ -195,24 +189,24 @@ def _fill_line_item_arithmetic(inv) -> None:
 
         if li.price_after_discount is None and li.unit_price is not None:
             li.price_after_discount = round(li.unit_price * (1 - disc), 4)
-            inv.derived_fields.add(f"line_items[{i}].price_after_discount")
+            inv.mark_derived(f"line_items[{i}].price_after_discount")
 
         if li.total_without_vat is None and li.quantity is not None and li.unit_price is not None:
             base = li.price_after_discount if li.price_after_discount is not None else li.unit_price * (1 - disc)
             li.total_without_vat = round(li.quantity * base, 2)
-            inv.derived_fields.add(f"line_items[{i}].total_without_vat")
+            inv.mark_derived(f"line_items[{i}].total_without_vat")
 
         if li.unit_price is None and li.total_without_vat is not None and li.quantity:
             denom = li.quantity * (1 - disc) if (1 - disc) else li.quantity
             if denom:
                 li.unit_price = round(li.total_without_vat / denom, 4)
-                inv.derived_fields.add(f"line_items[{i}].unit_price")
+                inv.mark_derived(f"line_items[{i}].unit_price")
 
         if li.quantity is None and li.total_without_vat is not None and li.unit_price:
             denom = li.unit_price * (1 - disc) if (1 - disc) else li.unit_price
             if denom:
                 li.quantity = round(li.total_without_vat / denom, 4)
-                inv.derived_fields.add(f"line_items[{i}].quantity")
+                inv.mark_derived(f"line_items[{i}].quantity")
 
 
 def _propagate_single_vat_rate(inv) -> None:
@@ -226,7 +220,7 @@ def _propagate_single_vat_rate(inv) -> None:
     for i, li in enumerate(inv.line_items):
         if li.vat_percent is None:
             li.vat_percent = sole_rate
-            inv.derived_fields.add(f"line_items[{i}].vat_percent")
+            inv.mark_derived(f"line_items[{i}].vat_percent")
 
 
 def _fill_line_item_vat_amount(inv) -> None:
@@ -234,7 +228,7 @@ def _fill_line_item_vat_amount(inv) -> None:
     for i, li in enumerate(inv.line_items or []):
         if li.vat_amount is None and li.total_without_vat is not None and li.vat_percent is not None:
             li.vat_amount = round(li.total_without_vat * li.vat_percent / 100.0, 2)
-            inv.derived_fields.add(f"line_items[{i}].vat_amount")
+            inv.mark_derived(f"line_items[{i}].vat_amount")
 
 
 def _derive_vat_breakdown_from_lines(inv) -> None:
@@ -257,7 +251,7 @@ def _derive_vat_breakdown_from_lines(inv) -> None:
         VatBreakdown(rate_percent=rate, base_amount=round(b["base"], 2), vat_amount=round(b["vat"], 2))
         for rate, b in sorted(buckets.items())
     ]
-    inv.derived_fields.add("vat_breakdown")
+    inv.mark_derived("vat_breakdown")
 
 
 def _cross_check_iban(invoice, text: str) -> None:

@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class ExtractedTable(BaseModel):
@@ -63,13 +63,22 @@ class InvoiceData(BaseModel):
         description="Detected currency code (EUR/BGN/USD/...). None = not extracted; display layer falls back to 'EUR'.",
     )
     notes: str | None = None
-    derived_fields: set[str] = Field(
-        default_factory=set,
-        description="Dotted paths of fields populated by normalization, not extraction",
-    )
+    # Internal provenance metadata. Not part of the extraction contract — must
+    # never appear in model_json_schema() handed to Gemini/Claude/Mistral, and
+    # the LLM must not be asked to populate it. Use mark_derived() to record
+    # which fields the pipeline filled by normalization (vs. extraction).
+    _derived_fields: set[str] = PrivateAttr(default_factory=set)
+
+    def mark_derived(self, path: str) -> None:
+        self._derived_fields.add(path)
 
     def is_derived(self, path: str) -> bool:
-        return path in self.derived_fields
+        return path in self._derived_fields
+
+    @property
+    def derived_fields(self) -> tuple[str, ...]:
+        """Read-only sorted view of dotted paths filled by normalization."""
+        return tuple(sorted(self._derived_fields))
 
 
 class ExtractedDocument(BaseModel):
