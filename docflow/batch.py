@@ -9,6 +9,7 @@ from docflow.output import write_excel
 from docflow.pipeline import NoExtractorFound, extract
 from docflow.registry import SupplierRegistry
 from docflow.schema import ExtractedDocument
+from docflow.status import compute_status
 from docflow.validators import validate
 
 SUPPORTED = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -40,7 +41,7 @@ def process_one(path: Path, registry: SupplierRegistry, provider: str = "auto") 
         doc.invoice, enrich_findings = registry.enrich(doc.invoice)
 
     validation_findings = validate(doc)
-    registry_findings = registry.record(doc.invoice) if doc.invoice else []
+    registry_findings = registry.record(doc.invoice, human_confirmed=False) if doc.invoice else []
 
     return BatchResult(
         path, None, doc, None,
@@ -105,38 +106,29 @@ def write_consolidated(results: list[BatchResult], output_path: Path) -> None:
 
     for r in results:
         if r.error:
-            inv_sheet.append([r.source.name, "ERROR", "", *[""] * 21, r.error])
+            status_label = compute_status(None, [], extraction_error=r.error).label
+            inv_sheet.append([r.source.name, status_label, "", *[""] * 21, r.error])
             continue
         doc = r.doc
         inv = doc.invoice
-        v_warn = sum(1 for f in r.validation_findings if f.level == "warning")
-        v_err = sum(1 for f in r.validation_findings if f.level == "error")
-        has_typed = inv is not None and inv.supplier is not None and inv.supplier.name
-        if not has_typed:
-            status = "FAILED"
-        elif v_err:
-            status = "ERR"
-        elif v_warn:
-            status = "WARN"
-        else:
-            status = "OK"
+        status_label = compute_status(doc, r.validation_findings).label
 
         if inv is None:
-            inv_sheet.append([r.source.name, status, doc.extraction_method, *[""] * 22])
+            inv_sheet.append([r.source.name, status_label, doc.extraction_method, *[""] * 22])
         else:
             inv_sheet.append([
-                r.source.name, status, doc.extraction_method,
+                r.source.name, status_label, doc.extraction_method,
                 inv.supplier.name, inv.supplier.eik, inv.supplier.vat_number,
                 inv.customer.name, inv.customer.eik, inv.customer.vat_number,
                 inv.invoice_number, inv.issue_date, inv.delivery_date, inv.payment_due_date,
-                inv.currency,
+                inv.currency or "EUR",
                 inv.subtotal, inv.discount, inv.net_amount,
                 inv.total_to_pay, inv.paid, inv.remaining,
                 inv.iban, inv.bank, inv.bic, inv.payment_method,
                 "",
             ])
 
-            for li in inv.line_items:
+            for li in (inv.line_items or []):
                 items_sheet.append([
                     r.source.name, inv.supplier.name, inv.invoice_number,
                     li.number, li.description, li.quantity, li.unit,
@@ -144,7 +136,7 @@ def write_consolidated(results: list[BatchResult], output_path: Path) -> None:
                     li.vat_percent, li.vat_amount, li.total_without_vat,
                 ])
 
-            for v in inv.vat_breakdown:
+            for v in (inv.vat_breakdown or []):
                 vat_sheet.append([
                     r.source.name, inv.supplier.name, inv.invoice_number,
                     v.rate_percent, v.base_amount, v.vat_amount,

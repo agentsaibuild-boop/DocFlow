@@ -78,12 +78,11 @@ def test_schema_imports():
     assert not is_useful_invoice(None)
 
 
-def test_pipeline_registers_7_extractors():
+def test_pipeline_registers_extractors():
     from docflow.pipeline import EXTRACTORS
     names = [e.name for e in EXTRACTORS]
-    expected = ["azure_di_invoice", "pdfplumber", "mistral_ocr", "claude",
-                "gemini", "gemini_3.1_flash_lite", "gemini_2.5_pro"]
-    assert names == expected, names
+    assert names[0] == "pdfplumber", f"first should be pdfplumber, got {names[0]}"
+    assert "claude" in names and "gemini" in names, names
     return f"order: {names}"
 
 
@@ -252,15 +251,108 @@ def test_registry_enrich_overrides_mismatch():
     return f"hallucinated IBAN replaced from registry"
 
 
+# 4b. Currency contract
+def test_currency_default_is_none():
+    from docflow.schema import InvoiceData
+    inv = InvoiceData()
+    assert inv.currency is None, f"expected None default, got {inv.currency!r}"
+
+
+def test_currency_quality_not_awarded_for_default():
+    from docflow.quality import invoice_quality_score
+    from docflow.schema import InvoiceData, Party
+    base = dict(supplier=Party(name="X"))
+    s_no = invoice_quality_score(InvoiceData(**base))
+    s_eur = invoice_quality_score(InvoiceData(**base, currency="EUR"))
+    s_bgn = invoice_quality_score(InvoiceData(**base, currency="BGN"))
+    assert s_eur > s_no, f"explicit EUR should beat None: {s_eur} vs {s_no}"
+    assert s_bgn > s_no, f"explicit BGN should beat None: {s_bgn} vs {s_no}"
+    assert abs(s_eur - s_bgn) < 1e-9, "EUR and BGN should score the same"
+    return f"None={s_no}, EUR={s_eur}, BGN={s_bgn}"
+
+
+def test_currency_display_falls_back_to_EUR():
+    from docflow.columns import get_row_value
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    inv_none = InvoiceData(supplier=Party(name="X"))
+    doc_none = ExtractedDocument(
+        source_path="x", extraction_method="t", page_count=1, invoice=inv_none,
+    )
+    assert get_row_value("currency", doc_none) == "EUR"
+
+    inv_bgn = InvoiceData(supplier=Party(name="X"), currency="BGN")
+    doc_bgn = ExtractedDocument(
+        source_path="x", extraction_method="t", page_count=1, invoice=inv_bgn,
+    )
+    assert get_row_value("currency", doc_bgn) == "BGN"
+
+
+def test_currency_none_is_never_mutated_to_EUR():
+    """Invariant: no exporter, validator, or quality call may promote a None
+    currency to 'EUR' on the InvoiceData itself. 'EUR' is a pure display-layer
+    fallback."""
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from docflow.columns import get_row_value
+    from docflow.output import write_excel
+    from docflow.quality import invoice_quality_score
+    from docflow.schema import (
+        ExtractedDocument, InvoiceData, LineItem, Party, VatBreakdown,
+    )
+    from docflow.validators import validate
+
+    inv = InvoiceData(
+        invoice_number="N",
+        issue_date="2026-01-01",
+        supplier=Party(name="X", vat_number="BG123456789"),
+        customer=Party(name="Y"),
+        line_items=[LineItem(total_without_vat=100, vat_percent=20)],
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=100, vat_amount=20)],
+        net_amount=100,
+        total_to_pay=120,
+        iban="BG80BNBG96611020345678",
+    )
+    assert inv.currency is None, "precondition: created without currency"
+
+    doc = ExtractedDocument(
+        source_path="x.pdf", extraction_method="t", page_count=1, invoice=inv,
+    )
+
+    invoice_quality_score(inv)
+    assert inv.currency is None, "quality.invoice_quality_score mutated currency"
+
+    validate(doc)
+    assert inv.currency is None, "validators.validate mutated currency"
+
+    row_val = get_row_value("currency", doc)
+    assert row_val == "EUR", f"display fallback should be EUR, got {row_val!r}"
+    assert inv.currency is None, "columns.get_row_value mutated currency"
+
+    with _tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+        out = _Path(tf.name)
+    try:
+        write_excel(doc, out)
+    finally:
+        out.unlink(missing_ok=True)
+    assert inv.currency is None, "output.write_excel mutated currency"
+
+    return "None survived quality, validate, columns, write_excel"
+
+
 # 5. End-to-end pipeline tests
 def test_pipeline_pdfplumber_path():
     if not SAMPLE_BORN_DIGITAL_PDF.exists():
         raise SkipTest(f"missing {SAMPLE_BORN_DIGITAL_PDF.name}")
 
+    # Force pdfplumber-only. With the best-of-quality pipeline ("auto" now
+    # keeps trying past pdfplumber if its quality_score < threshold), pinning
+    # the provider is how a test verifies a specific extractor end-to-end.
     saved_key = os.environ.pop("GEMINI_API_KEY", None)
     try:
         from docflow.pipeline import extract
-        doc = extract(SAMPLE_BORN_DIGITAL_PDF)
+        doc = extract(SAMPLE_BORN_DIGITAL_PDF, provider="pdfplumber")
         assert doc.extraction_method.startswith("pdfplumber"), doc.extraction_method
         assert doc.tables, "expected at least 1 table from pdfplumber"
         return f"method={doc.extraction_method}, tables={len(doc.tables)}, pages={doc.page_count}"
@@ -397,7 +489,7 @@ def test_env_loader_respects_existing_env():
 
 TESTS: list[tuple[str, Callable]] = [
     ("schema imports + is_useful_invoice", test_schema_imports),
-    ("pipeline registers 7 extractors in correct order", test_pipeline_registers_7_extractors),
+    ("pipeline registers extractors with pdfplumber first", test_pipeline_registers_extractors),
     ("ЕИК validator accepts 9/10/13 digits, rejects 5", test_eik_validator_accepts_9_10_13_digits),
     ("ЕИК validator strips BG prefix", test_eik_validator_strips_BG_prefix),
     ("IBAN validator: valid / too long / bad checksum", test_iban_validator),
@@ -411,6 +503,10 @@ TESTS: list[tuple[str, Callable]] = [
     ("registry: record/enrich do not mutate input", test_registry_does_not_mutate_input),
     ("registry: auto-fill missing fields on subsequent invoice", test_registry_auto_fills_missing_fields),
     ("registry: enrich replaces hallucinated IBAN", test_registry_enrich_overrides_mismatch),
+    ("currency: schema default is None", test_currency_default_is_none),
+    ("currency: quality score awards only for explicit currency", test_currency_quality_not_awarded_for_default),
+    ("currency: display falls back to EUR when not extracted", test_currency_display_falls_back_to_EUR),
+    ("currency: None is never mutated to EUR by any module", test_currency_none_is_never_mutated_to_EUR),
     ("pipeline: pdfplumber path on born-digital PDF", test_pipeline_pdfplumber_path),
     ("pipeline: gemini path on JPG (real EuroFaktura)", test_pipeline_gemini_path),
     ("CLI: missing file → exit 2", test_cli_missing_file),

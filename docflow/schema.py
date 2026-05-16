@@ -44,13 +44,13 @@ class InvoiceData(BaseModel):
     issue_date: str | None = Field(default=None, description="Дата на издаване, ISO format if possible")
     payment_due_date: str | None = Field(default=None, description="Да се плати до")
     delivery_date: str | None = Field(default=None, description="Дата на предоставяне")
-    supplier: Party = Field(default_factory=Party, description="Изпълнител")
-    customer: Party = Field(default_factory=Party, description="Получател")
-    line_items: list[LineItem] = Field(default_factory=list)
+    supplier: Party | None = Field(default_factory=Party, description="Изпълнител")
+    customer: Party | None = Field(default_factory=Party, description="Получател")
+    line_items: list[LineItem] | None = Field(default_factory=list)
     subtotal: float | None = Field(default=None, description="Сума без отстъпка")
     discount: float | None = Field(default=None, description="Отстъпка (positive value)")
     net_amount: float | None = Field(default=None, description="Обща нетна сума")
-    vat_breakdown: list[VatBreakdown] = Field(default_factory=list)
+    vat_breakdown: list[VatBreakdown] | None = Field(default_factory=list)
     total_to_pay: float | None = Field(default=None, description="За плащане")
     paid: float | None = Field(default=None, description="Платени")
     remaining: float | None = Field(default=None, description="Остава за плащане")
@@ -58,8 +58,18 @@ class InvoiceData(BaseModel):
     iban: str | None = None
     bank: str | None = None
     bic: str | None = None
-    currency: str = "BGN"
+    currency: str | None = Field(
+        default=None,
+        description="Detected currency code (EUR/BGN/USD/...). None = not extracted; display layer falls back to 'EUR'.",
+    )
     notes: str | None = None
+    derived_fields: set[str] = Field(
+        default_factory=set,
+        description="Dotted paths of fields populated by normalization, not extraction",
+    )
+
+    def is_derived(self, path: str) -> bool:
+        return path in self.derived_fields
 
 
 class ExtractedDocument(BaseModel):
@@ -70,6 +80,7 @@ class ExtractedDocument(BaseModel):
     tables: list[ExtractedTable] = Field(default_factory=list)
     full_text: str = ""
     invoice: InvoiceData | None = None
+    quality_score: float = 0.0
 
     @property
     def name(self) -> str:
@@ -86,7 +97,7 @@ def is_useful_invoice(inv: InvoiceData | None) -> bool:
         return True
     if inv.customer and inv.customer.eik:
         return True
-    if inv.line_items:
+    if inv.line_items and len(inv.line_items) > 0:
         return True
     if inv.total_to_pay is not None or inv.net_amount is not None:
         return True

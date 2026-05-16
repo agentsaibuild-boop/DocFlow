@@ -39,6 +39,11 @@ def write_excel(doc: ExtractedDocument, output_path: Path) -> None:
 
 def _write_invoice_sheets(wb: Workbook, inv: InvoiceData) -> None:
     bold = Font(bold=True)
+    s = inv.supplier or type(inv.supplier)() if inv.supplier is not None else None
+    c = inv.customer or type(inv.customer)() if inv.customer is not None else None
+    from docflow.schema import Party
+    s = inv.supplier if inv.supplier is not None else Party()
+    c = inv.customer if inv.customer is not None else Party()
 
     header = wb.create_sheet("invoice")
     rows = [
@@ -47,23 +52,23 @@ def _write_invoice_sheets(wb: Workbook, inv: InvoiceData) -> None:
         ("Дата издаване", inv.issue_date),
         ("Дата на предоставяне", inv.delivery_date),
         ("Срок на плащане", inv.payment_due_date),
-        ("Валута", inv.currency),
+        ("Валута", inv.currency or "EUR"),
         ("", ""),
         ("--- ИЗПЪЛНИТЕЛ ---", ""),
-        ("Име", inv.supplier.name),
-        ("Адрес", inv.supplier.address),
-        ("ЕИК", inv.supplier.eik),
-        ("ИН по ДДС", inv.supplier.vat_number),
-        ("МОЛ", inv.supplier.mol),
-        ("Телефон", inv.supplier.phone),
-        ("Email", inv.supplier.email),
+        ("Име", s.name),
+        ("Адрес", s.address),
+        ("ЕИК", s.eik),
+        ("ИН по ДДС", s.vat_number),
+        ("МОЛ", s.mol),
+        ("Телефон", s.phone),
+        ("Email", s.email),
         ("", ""),
         ("--- ПОЛУЧАТЕЛ ---", ""),
-        ("Име", inv.customer.name),
-        ("Адрес", inv.customer.address),
-        ("ЕИК", inv.customer.eik),
-        ("ИН по ДДС", inv.customer.vat_number),
-        ("МОЛ", inv.customer.mol),
+        ("Име", c.name),
+        ("Адрес", c.address),
+        ("ЕИК", c.eik),
+        ("ИН по ДДС", c.vat_number),
+        ("МОЛ", c.mol),
         ("", ""),
         ("--- ПЛАЩАНЕ ---", ""),
         ("Метод", inv.payment_method),

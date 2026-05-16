@@ -43,7 +43,7 @@ Examples:
 - Capture every row in the goods/services table.
 - Dates: parse from DD.MM.YYYY → YYYY-MM-DD.
 - Return null for fields not present. DO NOT hallucinate.
-- Currency defaults to BGN unless explicitly stated.
+- Currency: extract the code shown on the invoice (EUR, BGN, USD, ...). If not stated, return null — do NOT default.
 """
 
 
