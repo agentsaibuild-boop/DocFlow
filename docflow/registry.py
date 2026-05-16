@@ -54,7 +54,13 @@ class SupplierRegistry:
             row = c.execute("SELECT * FROM suppliers WHERE eik = ?", (eik,)).fetchone()
             return dict(row) if row else None
 
-    def record(self, inv: InvoiceData) -> list[RegistryFinding]:
+    def record(self, inv: InvoiceData, human_confirmed: bool = False) -> list[RegistryFinding]:
+        if not human_confirmed:
+            return [RegistryFinding(
+                level="info",
+                code="registry_skipped",
+                message="Registry write skipped — requires human confirmation",
+            )]
         if not inv.supplier:
             return []
         eik = _derive_eik(inv.supplier.eik, inv.supplier.vat_number)

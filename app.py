@@ -14,93 +14,14 @@ import streamlit as st
 from docflow.env import load_env_file
 load_env_file(Path(__file__).parent / ".env")
 
-from docflow.batch import BatchResult, write_consolidated
+from docflow.batch import BatchResult
+from docflow.columns import COLUMN_CATALOG, get_row_value
 from docflow.pipeline import AVAILABLE_PROVIDERS, extract, list_providers
 from docflow.registry import SupplierRegistry
+from docflow.status import compute_status
 from docflow.validators import validate
 
 DEFAULT_PROVIDER = "gemini-3.1-flash-lite"
-
-# (Колона за Excel, Етикет, Категория, По подразбиране)
-COLUMN_CATALOG = [
-    ("supplier_name",  "Доставчик",          "Основни",  True),
-    ("supplier_vat",   "Номер по ДДС",       "Основни",  True),
-    ("supplier_iban",  "IBAN доставчик",     "Основни",  True),
-    ("invoice_number", "Номер фактура",      "Основни",  True),
-    ("invoice_date",   "Дата фактура",       "Основни",  True),
-    ("net_amount",     "Цена без ДДС",       "Основни",  True),
-    ("vat_total",      "ДДС",                "Основни",  True),
-    ("total_to_pay",   "Крайна сума",        "Основни",  True),
-
-    ("supplier_eik",     "ЕИК доставчик",      "Доставчик",  False),
-    ("supplier_address", "Адрес доставчик",    "Доставчик",  False),
-    ("supplier_mol",     "МОЛ доставчик",      "Доставчик",  False),
-    ("supplier_phone",   "Телефон доставчик",  "Доставчик",  False),
-    ("supplier_email",   "Email доставчик",    "Доставчик",  False),
-    ("supplier_bank",    "Банка доставчик",    "Доставчик",  False),
-    ("supplier_bic",     "BIC доставчик",      "Доставчик",  False),
-
-    ("customer_name",    "Получател",          "Получател",  False),
-    ("customer_eik",     "ЕИК получател",      "Получател",  False),
-    ("customer_vat",     "Номер по ДДС получ.","Получател",  False),
-    ("customer_address", "Адрес получател",    "Получател",  False),
-    ("customer_mol",     "МОЛ получател",      "Получател",  False),
-
-    ("delivery_date",    "Дата доставка",      "Дати",       False),
-    ("due_date",         "Срок плащане",       "Дати",       False),
-
-    ("currency",         "Валута",             "Плащане",    False),
-    ("subtotal",         "Сума без отстъпка",  "Плащане",    False),
-    ("discount",         "Отстъпка",           "Плащане",    False),
-    ("payment_method",   "Метод плащане",      "Плащане",    False),
-    ("paid",             "Платени",            "Плащане",    False),
-    ("remaining",        "Остава",             "Плащане",    False),
-]
-
-
-def get_row_value(field: str, doc):
-    """Map a column key to the actual value from ExtractedDocument."""
-    if doc is None or doc.invoice is None:
-        return ""
-    inv = doc.invoice
-    s = inv.supplier
-    c = inv.customer
-    if inv.vat_breakdown:
-        vat_total = sum(v.vat_amount for v in inv.vat_breakdown)
-    elif inv.total_to_pay is not None and inv.net_amount is not None:
-        vat_total = round(inv.total_to_pay - inv.net_amount, 2)
-    else:
-        vat_total = None
-    return {
-        "supplier_name":    s.name if s else "",
-        "supplier_eik":     s.eik if s else "",
-        "supplier_vat":     s.vat_number if s else "",
-        "supplier_address": s.address if s else "",
-        "supplier_mol":     s.mol if s else "",
-        "supplier_phone":   s.phone if s else "",
-        "supplier_email":   s.email if s else "",
-        "supplier_iban":    inv.iban,
-        "supplier_bank":    inv.bank,
-        "supplier_bic":     inv.bic,
-        "customer_name":    c.name if c else "",
-        "customer_eik":     c.eik if c else "",
-        "customer_vat":     c.vat_number if c else "",
-        "customer_address": c.address if c else "",
-        "customer_mol":     c.mol if c else "",
-        "invoice_number":   inv.invoice_number,
-        "invoice_date":     inv.issue_date,
-        "delivery_date":    inv.delivery_date,
-        "due_date":         inv.payment_due_date,
-        "currency":         inv.currency,
-        "subtotal":         inv.subtotal,
-        "discount":         inv.discount,
-        "net_amount":       inv.net_amount,
-        "vat_total":        vat_total,
-        "total_to_pay":     inv.total_to_pay,
-        "payment_method":   inv.payment_method,
-        "paid":             inv.paid,
-        "remaining":        inv.remaining,
-    }.get(field, "")
 
 st.set_page_config(page_title="DocFlow", page_icon="📄", layout="wide")
 st.title("📄 DocFlow")
@@ -128,17 +49,23 @@ with st.sidebar:
     for key, label, cat, _ in COLUMN_CATALOG:
         categories.setdefault(cat, []).append((key, label))
 
+    label_to_key = {label: key for key, label, _, _ in COLUMN_CATALOG}
     selected_columns = []
+
     for cat, items in categories.items():
-        defaults = {key for key, _, c, d in COLUMN_CATALOG if c == cat and d}
-        with st.expander(cat, expanded=(cat == "Основни")):
-            for key, label in items:
-                checked = st.checkbox(
-                    label, value=(key in defaults), key=f"col_{key}",
-                )
-                if checked:
-                    selected_columns.append(key)
+        category_defaults = [label for key, label, c, d in COLUMN_CATALOG if c == cat and d]
+        category_labels = [label for _, label in items]
+        picked = st.multiselect(
+            cat,
+            options=category_labels,
+            default=category_defaults,
+            key=f"ms_{cat}",
+        )
+        for label in picked:
+            selected_columns.append(label_to_key[label])
+
     st.session_state["selected_columns"] = selected_columns
+    st.caption(f"✓ Активни колони: **{len(selected_columns)}**")
 
     st.divider()
     st.subheader("Статус на provider-и")
@@ -152,43 +79,72 @@ with st.sidebar:
 tab_upload, tab_results, tab_registry = st.tabs(["📤 Качване", "📊 Резултати", "🏢 Регистър"])
 
 
+MAX_PARALLEL = 5
+
+
+def _process_single(name, get_bytes, get_path, provider):
+    """Worker: runs in thread, no Streamlit calls."""
+    tmp_path = get_path()
+    cleanup = False
+    if tmp_path is None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix) as tf:
+            tf.write(get_bytes())
+            tmp_path = Path(tf.name)
+        cleanup = True
+    try:
+        doc = extract(tmp_path, provider=provider)
+        doc.source_path = name
+        return ("ok", name, doc, None)
+    except Exception as e:
+        msg = str(e).replace(str(tmp_path), name)
+        if "All extractors failed" in msg or "Gemini still unavailable" in msg or "503" in msg:
+            msg = f"{provider} върна 503/quota. Пробвай пак или избери друг model."
+        return ("err", name, None, f"{type(e).__name__}: {msg}")
+    finally:
+        if cleanup:
+            tmp_path.unlink(missing_ok=True)
+
+
 def process_files(file_sources, registry, provider):
     """file_sources: list of (display_name, get_bytes_callable, source_path_callable)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     results: list[BatchResult] = []
     progress = st.progress(0, text="Подготовка...")
-    for i, (name, get_bytes, get_path) in enumerate(file_sources, start=1):
-        progress.progress((i - 1) / len(file_sources),
-                          text=f"[{i}/{len(file_sources)}] {name}")
-        tmp_path = get_path()
-        cleanup = False
-        if tmp_path is None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(name).suffix) as tf:
-                tf.write(get_bytes())
-                tmp_path = Path(tf.name)
-            cleanup = True
-        try:
-            doc = extract(tmp_path, provider=provider)
-            doc.source_path = name
-            enrich_findings = []
-            if doc.invoice:
-                doc.invoice, enrich_findings = registry.enrich(doc.invoice)
-            validation_findings = validate(doc)
-            registry_findings = registry.record(doc.invoice) if doc.invoice else []
-            results.append(BatchResult(
-                Path(name), None, doc, None,
-                enrich_findings, validation_findings, registry_findings,
-            ))
-        except Exception as e:
-            msg = str(e).replace(str(tmp_path), name)
-            if "All extractors failed" in msg or "Gemini still unavailable" in msg or "503" in msg:
-                msg = f"{provider} върна 503/quota. Пробвай пак или избери друг model."
-            results.append(BatchResult(
-                Path(name), None, None,
-                f"{type(e).__name__}: {msg}", [], [], [],
-            ))
-        finally:
-            if cleanup:
-                tmp_path.unlink(missing_ok=True)
+    completed = 0
+    total = len(file_sources)
+
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+        futures = {
+            ex.submit(_process_single, name, get_bytes, get_path, provider): name
+            for name, get_bytes, get_path in file_sources
+        }
+        pending_results = []
+        for future in as_completed(futures):
+            completed += 1
+            name = futures[future]
+            progress.progress(completed / total,
+                              text=f"[{completed}/{total}] завършен: {name}")
+            status, name, doc, err = future.result()
+            pending_results.append((name, status, doc, err))
+
+    name_to_order = {(name): i for i, (name, _, _) in enumerate(file_sources)}
+    pending_results.sort(key=lambda r: name_to_order.get(r[0], 999999))
+
+    for name, status, doc, err in pending_results:
+        if status == "err":
+            results.append(BatchResult(Path(name), None, None, err, [], [], []))
+            continue
+        enrich_findings = []
+        if doc.invoice:
+            doc.invoice, enrich_findings = registry.enrich(doc.invoice)
+        validation_findings = validate(doc)
+        registry_findings = registry.record(doc.invoice, human_confirmed=False) if doc.invoice else []
+        results.append(BatchResult(
+            Path(name), None, doc, None,
+            enrich_findings, validation_findings, registry_findings,
+        ))
+
     progress.progress(1.0, text=f"Готово: {len(results)} файла")
     return results
 
@@ -278,13 +234,7 @@ with tab_upload:
     if process_btn and file_sources:
         registry = SupplierRegistry()
         results = process_files(file_sources, registry, provider)
-
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
-            output_path = Path(tf.name)
-        write_consolidated(results, output_path)
         st.session_state["last_results"] = results
-        st.session_state["last_xlsx"] = output_path.read_bytes()
-        output_path.unlink(missing_ok=True)
 
         ok = sum(1 for r in results if r.error is None and r.doc and r.doc.invoice
                  and r.doc.invoice.supplier and r.doc.invoice.supplier.name)
@@ -310,24 +260,30 @@ with tab_results:
         for r in results:
             row = {"Файл": r.source.name}
             if r.error:
-                row["Статус"] = "❌ ERROR"
+                status = compute_status(None, [], extraction_error=r.error)
+                row["Статус"] = status.label
                 row["Метод"] = "—"
                 for col in selected:
                     row[label_for[col]] = ""
                 row["Бележки"] = r.error[:80]
             else:
                 doc = r.doc
-                inv = doc.invoice
-                if inv is None or not inv.supplier or not inv.supplier.name:
-                    row["Статус"] = "⚠️ Без данни"
-                elif any(f.level == "error" for f in r.validation_findings):
-                    row["Статус"] = "⚠️ Има грешки"
-                else:
-                    row["Статус"] = "✅ OK"
                 row["Метод"] = doc.extraction_method.replace("gemini:", "").replace(":claude-sonnet-4-6", "")
+
                 for col in selected:
                     row[label_for[col]] = get_row_value(col, doc)
-                row["Бележки"] = ""
+
+                status = compute_status(
+                    doc,
+                    r.validation_findings,
+                    required_column_keys=selected,
+                )
+                row["Статус"] = status.label
+                if status.code == "INCOMPLETE":
+                    empty_labels = [label_for[k] for k in status.empty_columns]
+                    row["Бележки"] = "Празни: " + ", ".join(empty_labels)
+                else:
+                    row["Бележки"] = ""
             rows.append(row)
 
         df = pd.DataFrame(rows)
@@ -335,27 +291,61 @@ with tab_results:
         xlsx_buf = io.BytesIO()
         df.to_excel(xlsx_buf, index=False, sheet_name="Фактури")
 
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            st.download_button(
-                "⬇️ Свали Excel (избрани колони)",
-                data=xlsx_buf.getvalue(),
-                file_name="Фактури.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True,
-            )
-        with col_dl2:
-            st.download_button(
-                "⬇️ Свали пълен Excel (всички листи)",
-                data=st.session_state["last_xlsx"],
-                file_name="Фактури_пълен.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+        st.download_button(
+            "⬇️ Свали Excel",
+            data=xlsx_buf.getvalue(),
+            file_name="Фактури.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
 
         st.subheader(f"Преглед — {len(selected)} избрани колони")
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("💾 Запис в регистър на доставчик")
+        st.caption(
+            "Регистърът се записва **само** след ръчно потвърждение. "
+            "Това предотвратява автоматично закотвяне на грешно извлечени данни."
+        )
+
+        recordable: list[tuple[int, BatchResult]] = []
+        for idx, r in enumerate(results):
+            if r.error or not r.doc or not r.doc.invoice:
+                continue
+            inv = r.doc.invoice
+            if not inv.supplier or not inv.supplier.name:
+                continue
+            if not (inv.supplier.eik or inv.supplier.vat_number):
+                continue
+            recordable.append((idx, r))
+
+        if not recordable:
+            st.info("Няма фактури с достатъчно данни за запис (нужни са име на доставчик + ЕИК или ИН по ДДС).")
+        else:
+            options = {
+                f"{r.source.name} — {r.doc.invoice.supplier.name}": (idx, r)
+                for idx, r in recordable
+            }
+            choice = st.selectbox(
+                "Избери фактура за запис на доставчика",
+                options=list(options.keys()),
+            )
+            if choice and st.button(
+                "Потвърждавам данните и записвам доставчика",
+                type="primary",
+                key="confirm_record",
+            ):
+                _, chosen = options[choice]
+                registry = SupplierRegistry()
+                findings = registry.record(chosen.doc.invoice, human_confirmed=True)
+                for f in findings:
+                    if f.level == "ok":
+                        st.success(f.message)
+                    elif f.level == "warning":
+                        st.warning(f.message)
+                    else:
+                        st.info(f.message)
 
         with st.expander("🔍 Validation проблеми (детайли)"):
             issues_rows = []

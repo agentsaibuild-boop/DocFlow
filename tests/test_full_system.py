@@ -82,7 +82,7 @@ def test_pipeline_registers_extractors():
     from docflow.pipeline import EXTRACTORS
     names = [e.name for e in EXTRACTORS]
     assert names[0] == "pdfplumber", f"first should be pdfplumber, got {names[0]}"
-    assert "claude" in names and "gemini" in names, names
+    assert "groq" in names and "claude" in names and "gemini" in names, names
     return f"order: {names}"
 
 
@@ -184,7 +184,7 @@ def test_registry_new_supplier():
 
     r = SupplierRegistry()
     inv = InvoiceData(supplier=Party(name="ООД Тест", vat_number="BG123456789"))
-    findings = r.record(inv)
+    findings = r.record(inv, human_confirmed=True)
     assert len(findings) == 1 and findings[0].code == "supplier_new"
 
     suppliers = r.all()
@@ -200,7 +200,7 @@ def test_registry_does_not_mutate_input():
     r = SupplierRegistry()
     inv = InvoiceData(supplier=Party(name="X", vat_number="BG123456789"))
     eik_before = inv.supplier.eik
-    r.record(inv)
+    r.record(inv, human_confirmed=True)
     assert inv.supplier.eik == eik_before, f"record mutated input.eik to {inv.supplier.eik}"
 
     inv2 = InvoiceData(supplier=Party(name="X", vat_number="BG123456789"))
@@ -216,11 +216,11 @@ def test_registry_auto_fills_missing_fields():
     from docflow.schema import InvoiceData, Party
 
     r = SupplierRegistry()
-    r.record(InvoiceData(supplier=Party(name="X", vat_number="BG123456789")))
+    r.record(InvoiceData(supplier=Party(name="X", vat_number="BG123456789")), human_confirmed=True)
     r.record(InvoiceData(
         supplier=Party(name="X", vat_number="BG123456789", address="ул. Тест 1"),
         iban="BG80BNBG96611020345678",
-    ))
+    ), human_confirmed=True)
     s = r.all()[0]
     assert s["address"] == "ул. Тест 1"
     assert s["iban"] == "BG80BNBG96611020345678"
@@ -238,7 +238,7 @@ def test_registry_enrich_overrides_mismatch():
     r.record(InvoiceData(
         supplier=Party(name="X", vat_number="BG123456789"),
         iban="BG80BNBG96611020345678",
-    ))
+    ), human_confirmed=True)
     # simulate hallucinated IBAN coming from extractor
     bad_inv = InvoiceData(
         supplier=Party(name="X", vat_number="BG123456789"),
@@ -289,15 +289,17 @@ def test_currency_display_falls_back_to_EUR():
 
 
 def test_currency_none_is_never_mutated_to_EUR():
-    """Invariant: no exporter, validator, or quality call may promote a None
-    currency to 'EUR' on the InvoiceData itself. 'EUR' is a pure display-layer
-    fallback."""
+    """Invariant: no exporter, validator, registry, or quality call may
+    promote a None currency to 'EUR' on the InvoiceData itself. 'EUR' is a
+    pure display-layer fallback."""
+    clean_registry()
     import tempfile as _tempfile
     from pathlib import Path as _Path
 
     from docflow.columns import get_row_value
     from docflow.output import write_excel
     from docflow.quality import invoice_quality_score
+    from docflow.registry import SupplierRegistry
     from docflow.schema import (
         ExtractedDocument, InvoiceData, LineItem, Party, VatBreakdown,
     )
@@ -320,16 +322,30 @@ def test_currency_none_is_never_mutated_to_EUR():
         source_path="x.pdf", extraction_method="t", page_count=1, invoice=inv,
     )
 
+    # 1. Quality scoring must not mutate.
     invoice_quality_score(inv)
     assert inv.currency is None, "quality.invoice_quality_score mutated currency"
 
+    # 2. Validation must not mutate.
     validate(doc)
     assert inv.currency is None, "validators.validate mutated currency"
 
+    # 3. Registry enrich + confirmed record must not mutate.
+    r = SupplierRegistry()
+    r.record(inv, human_confirmed=True)
+    assert inv.currency is None, "registry.record mutated currency"
+    enriched, _ = r.enrich(inv)
+    assert inv.currency is None, "registry.enrich mutated source currency"
+    # enriched is a deep copy — its currency may differ if registry had one,
+    # but here we never stored a currency so it should still be None.
+    assert enriched.currency is None, "registry.enrich invented a currency"
+
+    # 4. Column resolver returns 'EUR' fallback without touching inv.
     row_val = get_row_value("currency", doc)
     assert row_val == "EUR", f"display fallback should be EUR, got {row_val!r}"
     assert inv.currency is None, "columns.get_row_value mutated currency"
 
+    # 5. Excel writer must not mutate.
     with _tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
         out = _Path(tf.name)
     try:
@@ -338,7 +354,42 @@ def test_currency_none_is_never_mutated_to_EUR():
         out.unlink(missing_ok=True)
     assert inv.currency is None, "output.write_excel mutated currency"
 
-    return "None survived quality, validate, columns, write_excel"
+    return "None survived quality, validate, registry record+enrich, columns, write_excel"
+
+
+# 4c. Registry human-confirmation gate
+def test_registry_no_auto_write_without_confirmation():
+    clean_registry()
+    from docflow.registry import SupplierRegistry
+    from docflow.schema import InvoiceData, Party
+
+    r = SupplierRegistry()
+    inv = InvoiceData(supplier=Party(name="X", vat_number="BG123456789"))
+    findings = r.record(inv)  # default human_confirmed=False
+    assert r.all() == [], f"unexpected write: {r.all()}"
+    assert len(findings) == 1 and findings[0].code == "registry_skipped"
+    assert findings[0].level == "info"
+    return "default call returns registry_skipped, DB untouched"
+
+
+def test_registry_writes_only_after_confirmation():
+    clean_registry()
+    from docflow.registry import SupplierRegistry
+    from docflow.schema import InvoiceData, Party
+
+    r = SupplierRegistry()
+    inv = InvoiceData(supplier=Party(name="X", vat_number="BG123456789"))
+
+    # First call without confirmation → no write.
+    r.record(inv)
+    assert r.all() == [], "unconfirmed call must not persist"
+
+    # Same data with confirmation → write.
+    findings = r.record(inv, human_confirmed=True)
+    assert any(f.code == "supplier_new" for f in findings), [f.code for f in findings]
+    suppliers = r.all()
+    assert len(suppliers) == 1 and suppliers[0]["eik"] == "123456789"
+    return "unconfirmed→skipped, confirmed→persisted"
 
 
 # 5. End-to-end pipeline tests
@@ -507,6 +558,8 @@ TESTS: list[tuple[str, Callable]] = [
     ("currency: quality score awards only for explicit currency", test_currency_quality_not_awarded_for_default),
     ("currency: display falls back to EUR when not extracted", test_currency_display_falls_back_to_EUR),
     ("currency: None is never mutated to EUR by any module", test_currency_none_is_never_mutated_to_EUR),
+    ("registry: no auto-write without human_confirmed", test_registry_no_auto_write_without_confirmation),
+    ("registry: writes only after human_confirmed=True", test_registry_writes_only_after_confirmation),
     ("pipeline: pdfplumber path on born-digital PDF", test_pipeline_pdfplumber_path),
     ("pipeline: gemini path on JPG (real EuroFaktura)", test_pipeline_gemini_path),
     ("CLI: missing file → exit 2", test_cli_missing_file),
