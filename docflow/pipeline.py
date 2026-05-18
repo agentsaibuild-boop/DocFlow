@@ -5,6 +5,7 @@ from docflow.extractors.azure_extractor import AzureExtractor
 from docflow.extractors.claude_extractor import ClaudeExtractor
 from docflow.extractors.gemini_extractor import GeminiExtractor
 from docflow.extractors.mistral_extractor import MistralExtractor
+from docflow.extractors.openrouter_extractor import OpenRouterExtractor
 from docflow.extractors.pdfplumber_extractor import PdfplumberExtractor
 from docflow.quality import invoice_quality_score
 from docflow.schema import ExtractedDocument, is_useful_invoice
@@ -24,6 +25,10 @@ EXTRACTORS: list[Extractor] = [
     GeminiExtractor(),      # 5th: Gemini default (model from GEMINI_MODEL env)
     GeminiExtractor(model="gemini-3.1-flash-lite", name="gemini_3.1_flash_lite"),
     GeminiExtractor(model="gemini-2.5-pro", name="gemini_2.5_pro"),
+    OpenRouterExtractor(
+        model="qwen/qwen3-vl-235b-a22b-instruct",
+        name="qwen_3_vl_235b",
+    ),  # best Cyrillic OCR in 10-file benchmark (score 0.99, ~25s latency)
 ]
 
 PROVIDER_ALIASES = {
@@ -34,6 +39,7 @@ PROVIDER_ALIASES = {
     "gemini": "gemini",
     "gemini-3.1-flash-lite": "gemini_3.1_flash_lite",
     "gemini-2.5-pro": "gemini_2.5_pro",
+    "qwen-3-vl-235b": "qwen_3_vl_235b",
 }
 
 AVAILABLE_PROVIDERS = ["auto"] + list(PROVIDER_ALIASES.keys())
