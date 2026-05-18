@@ -70,21 +70,102 @@ def list_providers() -> list[tuple[str, bool, str]]:
 
 
 class NoExtractorFound(Exception):
-    pass
+    """Raised when no registered extractor can handle the input file type."""
 
 
-def extract(path: Path, provider: str = "auto") -> ExtractedDocument:
-    if provider != "auto":
+class ProviderError(Exception):
+    """Provider/transport failure — separate from document-quality failure.
+
+    A ProviderError means we couldn't get a response from the provider
+    (quota exceeded, rate-limited, 5xx, auth missing, network down). It
+    does NOT mean the document is bad or that extraction quality is low —
+    the document was never given a fair attempt.
+
+    Batch callers must surface ProviderError separately from extraction
+    success/failure so quota events don't poison quality metrics.
+    """
+
+    def __init__(self, provider: str, kind: str, message: str, original: Exception | None = None):
+        self.provider = provider
+        self.kind = kind        # "quota" | "auth" | "network" | "other"
+        self.original = original
+        super().__init__(f"[{provider}/{kind}] {message}")
+
+
+_QUOTA_HINTS = (
+    "429", "503", "quota", "rate limit", "rate_limit",
+    "resource_exhausted", "exhausted", "too many requests",
+    "overloaded",
+)
+_AUTH_HINTS = (
+    "401", "403", "unauthorized", "invalid api key", "authentication",
+    "permission denied",
+)
+_NETWORK_HINTS = (
+    "connection", "timeout", "timed out", "dns", "name resolution",
+    "ssl", "tls handshake",
+)
+
+
+def _classify_provider_error(provider: str, exc: Exception) -> ProviderError:
+    msg = str(exc).lower()
+    if any(h in msg for h in _QUOTA_HINTS):
+        kind = "quota"
+    elif any(h in msg for h in _AUTH_HINTS):
+        kind = "auth"
+    elif any(h in msg for h in _NETWORK_HINTS):
+        kind = "network"
+    else:
+        kind = "other"
+    return ProviderError(provider, kind, str(exc), original=exc)
+
+
+def extract(
+    path: Path,
+    provider: str = "auto",
+    allow_fallback: bool | None = None,
+) -> ExtractedDocument:
+    """Extract one document.
+
+    Behavior contract:
+      • provider="auto"     → try the registered chain. allow_fallback defaults to True.
+        On provider errors the next extractor is tried. If every extractor errored
+        and none returned a useful result, raise ProviderError (last error's kind).
+      • provider=<explicit> → use ONLY that extractor. allow_fallback defaults to False.
+        On any error from that provider, raise ProviderError. Caller stays in control
+        of which model produced the result. To opt into "use this first, but fall
+        back to the rest on quota/transport", pass allow_fallback=True explicitly.
+
+    Why this design: explicit provider selection is a deliberate user choice. Silently
+    falling back would lie about which model produced the row. The override exists
+    for batch scenarios where you'd rather accept any model than fail mid-run on a
+    transient 503.
+
+    Raises:
+      ValueError         — unknown provider alias
+      NoExtractorFound   — no registered extractor can handle this file type
+      ProviderError      — provider/transport failure (quota/auth/network/other)
+    """
+    explicit = provider != "auto"
+    if allow_fallback is None:
+        allow_fallback = not explicit
+
+    if explicit:
         if provider not in PROVIDER_ALIASES:
             raise ValueError(f"Unknown provider '{provider}'. Available: {AVAILABLE_PROVIDERS}")
         target_name = PROVIDER_ALIASES[provider]
-        extractors = [e for e in EXTRACTORS if e.name == target_name]
-        if not extractors:
+        primary = [e for e in EXTRACTORS if e.name == target_name]
+        if not primary:
             raise RuntimeError(f"Provider '{provider}' not registered in pipeline")
+        if allow_fallback:
+            rest = [e for e in EXTRACTORS if e.name != target_name]
+            extractors = primary + rest
+        else:
+            extractors = primary
     else:
         extractors = EXTRACTORS
 
-    last_error: Exception | None = None
+    last_provider_error: ProviderError | None = None
     tried: list[str] = []
     best_doc: ExtractedDocument | None = None
     best_score: float = -1.0
@@ -126,16 +207,29 @@ def extract(path: Path, provider: str = "auto") -> ExtractedDocument:
                 best_doc = doc
                 best_score = doc.quality_score
         except Exception as e:
-            last_error = e
-            print(f"  {extractor.name} failed ({type(e).__name__}), falling back", flush=True)
+            perr = _classify_provider_error(extractor.name, e)
+            last_provider_error = perr
+            print(f"  {extractor.name} failed ({perr.kind}: {type(e).__name__})", flush=True)
+            if not allow_fallback:
+                raise perr from e
+            # otherwise: continue to next extractor
 
     if best_doc is not None:
         return best_doc
 
     if tried:
-        raise RuntimeError(
-            f"All extractors failed for {path.name}: {', '.join(tried)}. Last error: {last_error}"
-        ) from last_error
+        if last_provider_error is not None:
+            raise ProviderError(
+                provider=",".join(tried),
+                kind=last_provider_error.kind,
+                message=f"All extractors failed for {path.name}: {', '.join(tried)}",
+                original=last_provider_error.original,
+            )
+        # Tried something but nothing returned and no exception — shouldn't happen.
+        raise ProviderError(
+            provider=",".join(tried), kind="other",
+            message=f"All extractors returned no result for {path.name}",
+        )
     raise NoExtractorFound(f"No extractor can handle {path.name}")
 
 

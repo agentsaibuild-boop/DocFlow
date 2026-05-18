@@ -412,6 +412,276 @@ def test_math_mismatch_always_produces_error():
     return f"math error → {result.code}: {result.notes}"
 
 
+def test_supplier_vat_exempt_for_foreign_and_known_saas():
+    """BG VAT must not gate status for foreign / known-foreign-SaaS suppliers.
+    GitHub Inc. (no VAT at all, no IBAN, USD) → OK.
+    Canva (non-BG VAT, no IBAN) → OK.
+    BG supplier with missing VAT and the column selected → INCOMPLETE."""
+    from docflow.schema import InvoiceData, Party
+    from docflow.status import (
+        SupplierOrigin, compute_status, is_known_foreign_saas, supplier_origin,
+    )
+
+    required = [
+        "supplier_name", "supplier_vat", "supplier_iban",
+        "invoice_number", "invoice_date", "net_amount", "total_to_pay",
+    ]
+
+    # 1. GitHub: unknown origin (no VAT, no EIK), name matches SaaS list.
+    inv_gh = InvoiceData(
+        invoice_number="GH-1", issue_date="2026-05-01",
+        supplier=Party(name="GitHub, Inc."),
+        customer=Party(name="Купувач"),
+        net_amount=10.0, total_to_pay=10.0, currency="USD",
+    )
+    assert supplier_origin(inv_gh) == SupplierOrigin.UNKNOWN
+    assert is_known_foreign_saas(inv_gh)
+    r1 = compute_status(_make_doc(inv_gh), [], required_column_keys=required)
+    assert r1.code == "OK", f"GitHub expected OK, got {r1.code}: {r1.notes} (empty={r1.empty_columns})"
+
+    # 2. Canva: explicit non-BG VAT → FOREIGN.
+    inv_canva = InvoiceData(
+        invoice_number="CV-1", issue_date="2026-05-01",
+        supplier=Party(name="Canva Pty Ltd", vat_number="IE3722896KH"),
+        customer=Party(name="Купувач"),
+        net_amount=12.99, total_to_pay=12.99, currency="EUR",
+    )
+    assert supplier_origin(inv_canva) == SupplierOrigin.FOREIGN
+    r2 = compute_status(_make_doc(inv_canva), [], required_column_keys=required)
+    assert r2.code == "OK", f"Canva expected OK, got {r2.code}: {r2.notes} (empty={r2.empty_columns})"
+
+    # 3. BG supplier, missing VAT, VAT column selected → INCOMPLETE on supplier_vat.
+    inv_bg = InvoiceData(
+        invoice_number="BG-1", issue_date="2026-05-01",
+        supplier=Party(name="БГ ООД", eik="123456789"),  # no vat_number
+        customer=Party(name="X"),
+        iban="BG80BNBG96611020345678",
+        net_amount=100.0, total_to_pay=120.0, currency="BGN",
+    )
+    assert supplier_origin(inv_bg) == SupplierOrigin.BG
+    r3 = compute_status(_make_doc(inv_bg), [], required_column_keys=required)
+    assert r3.code == "INCOMPLETE", f"BG without VAT expected INCOMPLETE, got {r3.code}"
+    assert "supplier_vat" in r3.empty_columns
+    return f"GitHub→OK, Canva→OK, BG-no-VAT→INCOMPLETE"
+
+
+def test_known_saas_does_not_fabricate_vat():
+    """The known-SaaS exemption must affect column-required logic only —
+    it must never write a value into supplier.vat_number."""
+    from docflow.schema import InvoiceData, Party
+    from docflow.status import compute_status, is_known_foreign_saas
+
+    inv = InvoiceData(
+        invoice_number="X", issue_date="2026-05-01",
+        supplier=Party(name="OpenAI, LLC"),
+        customer=Party(name="Y"),
+        net_amount=20.0, total_to_pay=20.0, currency="USD",
+    )
+    assert is_known_foreign_saas(inv)
+    assert inv.supplier.vat_number is None, "precondition"
+    compute_status(_make_doc(inv), [], required_column_keys=["supplier_vat"])
+    assert inv.supplier.vat_number is None, "status must not invent VAT"
+    return "vat_number stays None after status evaluation"
+
+
+# 4d. Provider error semantics
+class _FakeExtractor:
+    """Minimal extractor stub for testing provider-error pathways."""
+    def __init__(self, name, *, can=True, raises=None, doc_factory=None):
+        self.name = name
+        self._can = can
+        self._raises = raises
+        self._doc_factory = doc_factory
+
+    def can_handle(self, path):
+        return self._can
+
+    def extract(self, path):
+        if self._raises is not None:
+            raise self._raises
+        return self._doc_factory()
+
+
+def _trivial_doc(method="fake", score=None):
+    """Build a minimal extracted document. Score=None lets the pipeline compute it."""
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+    inv = InvoiceData(
+        invoice_number="F-1", issue_date="2026-05-01",
+        supplier=Party(name="Foo ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="Купувач"),
+        net_amount=100.0, total_to_pay=120.0, currency="BGN",
+    )
+    doc = ExtractedDocument(
+        source_path="x.pdf", extraction_method=method, page_count=1, invoice=inv,
+    )
+    if score is not None:
+        doc.quality_score = score
+    return doc
+
+
+def test_explicit_provider_does_not_fallback_by_default(tmp_path=None):
+    """Explicit provider + quota 503 → ProviderError, not silent fallback."""
+    import docflow.pipeline as pipeline
+    from docflow.pipeline import ProviderError
+
+    quota_exc = RuntimeError("503 Service Unavailable: quota exceeded")
+    original = pipeline.EXTRACTORS
+    original_aliases = pipeline.PROVIDER_ALIASES
+    try:
+        pipeline.EXTRACTORS = [
+            _FakeExtractor("primary", raises=quota_exc),
+            _FakeExtractor("backup", doc_factory=lambda: _trivial_doc("backup")),
+        ]
+        pipeline.PROVIDER_ALIASES = {"primary": "primary", "backup": "backup"}
+        from pathlib import Path as _P
+        raised = None
+        try:
+            pipeline.extract(_P("/tmp/whatever.pdf"), provider="primary")
+        except ProviderError as e:
+            raised = e
+        assert raised is not None, "explicit provider must raise ProviderError, not return"
+        assert raised.provider == "primary"
+        assert raised.kind == "quota", f"expected 'quota', got {raised.kind!r}"
+    finally:
+        pipeline.EXTRACTORS = original
+        pipeline.PROVIDER_ALIASES = original_aliases
+    return "explicit primary 503 → ProviderError(quota), no fallback"
+
+
+def test_explicit_provider_with_allow_fallback_uses_backup():
+    """Explicit provider + allow_fallback=True + quota → fallback to next extractor."""
+    import docflow.pipeline as pipeline
+
+    quota_exc = RuntimeError("429 too many requests")
+    original = pipeline.EXTRACTORS
+    original_aliases = pipeline.PROVIDER_ALIASES
+    try:
+        pipeline.EXTRACTORS = [
+            _FakeExtractor("primary", raises=quota_exc),
+            _FakeExtractor("backup", doc_factory=lambda: _trivial_doc("backup", score=0.9)),
+        ]
+        pipeline.PROVIDER_ALIASES = {"primary": "primary", "backup": "backup"}
+        from pathlib import Path as _P
+        doc = pipeline.extract(_P("/tmp/whatever.pdf"), provider="primary", allow_fallback=True)
+        assert doc.extraction_method == "backup"
+    finally:
+        pipeline.EXTRACTORS = original
+        pipeline.PROVIDER_ALIASES = original_aliases
+    return "allow_fallback=True → backup ran"
+
+
+def test_auto_provider_falls_back_on_quota():
+    """provider='auto' falls back automatically on quota."""
+    import docflow.pipeline as pipeline
+
+    original = pipeline.EXTRACTORS
+    try:
+        pipeline.EXTRACTORS = [
+            _FakeExtractor("first", raises=RuntimeError("503 server overloaded")),
+            _FakeExtractor("second", doc_factory=lambda: _trivial_doc("second", score=0.9)),
+        ]
+        from pathlib import Path as _P
+        doc = pipeline.extract(_P("/tmp/whatever.pdf"), provider="auto")
+        assert doc.extraction_method == "second"
+    finally:
+        pipeline.EXTRACTORS = original
+    return "auto fell back to second after 503"
+
+
+def test_provider_error_does_not_poison_quality_metrics():
+    """If a sub-threshold result was already obtained, a later provider quota
+    error must NOT raise — pipeline returns best_doc with score preserved."""
+    import docflow.pipeline as pipeline
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    original = pipeline.EXTRACTORS
+    try:
+        # Sparse invoice → score below the 0.7 threshold so the pipeline keeps
+        # trying the next extractor. Second 503s. Expected: return the sparse
+        # doc, score recomputed (~0.15), no exception.
+        def sparse_doc():
+            # Has invoice_number → is_useful_invoice; ~0.25 score → below 0.7 threshold.
+            inv = InvoiceData(invoice_number="S-1", supplier=Party(name="Sparse ООД"))
+            return ExtractedDocument(
+                source_path="x.pdf", extraction_method="first", page_count=1, invoice=inv,
+            )
+
+        pipeline.EXTRACTORS = [
+            _FakeExtractor("first", doc_factory=sparse_doc),
+            _FakeExtractor("second", raises=RuntimeError("503 quota exceeded")),
+        ]
+        from pathlib import Path as _P
+        doc = pipeline.extract(_P("/tmp/whatever.pdf"), provider="auto")
+        assert doc.extraction_method == "first", f"got {doc.extraction_method}"
+        # The score must reflect the sparse doc (name only ≈ 0.15), not be
+        # zeroed/None by the second extractor's quota event.
+        assert 0.0 < doc.quality_score < 0.7, f"unexpected score: {doc.quality_score}"
+    finally:
+        pipeline.EXTRACTORS = original
+    return "best_doc preserved from first extractor despite second's quota"
+
+
+def test_provider_error_classification():
+    """Error message → kind detection."""
+    from docflow.pipeline import _classify_provider_error
+    cases = [
+        (RuntimeError("HTTP 429 Too Many Requests"), "quota"),
+        (RuntimeError("503 server unavailable"), "quota"),
+        (RuntimeError("RESOURCE_EXHAUSTED"), "quota"),
+        (RuntimeError("401 Unauthorized"), "auth"),
+        (RuntimeError("Invalid API key"), "auth"),
+        (RuntimeError("Connection timed out"), "network"),
+        (RuntimeError("DNS resolution failed"), "network"),
+        (RuntimeError("Something else went wrong"), "other"),
+    ]
+    for exc, expected in cases:
+        perr = _classify_provider_error("test", exc)
+        assert perr.kind == expected, f"{exc!r} → expected {expected}, got {perr.kind}"
+    return f"{len(cases)} classifications correct"
+
+
+def test_summarize_batch_counts():
+    """summarize_batch keeps provider failures separate from document failures."""
+    from docflow.batch import BatchResult, summarize_batch
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+    from docflow.validators import ValidationFinding
+    from pathlib import Path as _P
+
+    ok_inv = InvoiceData(
+        invoice_number="OK-1", issue_date="2026-01-01",
+        supplier=Party(name="ОК ООД", eik="123456789"),
+        net_amount=100.0, total_to_pay=120.0,
+    )
+    ok_doc = ExtractedDocument(source_path="ok.pdf", extraction_method="m", page_count=1, invoice=ok_inv)
+
+    bad_inv = ok_inv.model_copy(update={"invoice_number": "BAD-1"})
+    bad_doc = ExtractedDocument(source_path="bad.pdf", extraction_method="m", page_count=1, invoice=bad_inv)
+    err_finding = ValidationFinding(level="error", code="math_x", message="x")
+
+    no_data_doc = ExtractedDocument(source_path="empty.pdf", extraction_method="m", page_count=1, invoice=None)
+
+    results = [
+        BatchResult(_P("ok.pdf"), None, ok_doc, None, [], [], []),
+        BatchResult(_P("bad.pdf"), None, bad_doc, None, [], [err_finding], []),
+        BatchResult(_P("empty.pdf"), None, no_data_doc, None, [], [], []),
+        BatchResult(_P("q1.pdf"), None, None, None, [], [], [],
+                    provider_error="[gemini/quota] 503", provider_error_kind="quota"),
+        BatchResult(_P("q2.pdf"), None, None, None, [], [], [],
+                    provider_error="[gemini/quota] 503", provider_error_kind="quota"),
+        BatchResult(_P("crash.pdf"), None, None, "ValueError: bad data", [], [], []),
+    ]
+    s = summarize_batch(results)
+    assert s == {
+        "processed": 6,
+        "extracted_ok": 1,
+        "validation_errors": 1,
+        "no_data": 1,
+        "provider_failures": 2,
+        "unknown_errors": 1,
+    }, s
+    return str(s)
+
+
 def test_reject_criteria_end_to_end_xlsx():
     """End-to-end acceptance: build the three reject-criteria scenarios as real
     InvoiceData, run them through write_consolidated → reload xlsx → assert
@@ -847,6 +1117,14 @@ TESTS: list[tuple[str, Callable]] = [
     ("status: foreign supplier without IBAN is not INCOMPLETE", test_foreign_supplier_no_iban_not_incomplete),
     ("status: BG supplier with bank payment + no IBAN is INCOMPLETE", test_bg_supplier_no_iban_incomplete_with_bank_payment),
     ("status: math mismatch always produces VALIDATION_ERROR", test_math_mismatch_always_produces_error),
+    ("status: supplier_vat exempt for FOREIGN and known-SaaS", test_supplier_vat_exempt_for_foreign_and_known_saas),
+    ("status: known-SaaS exemption does not fabricate VAT", test_known_saas_does_not_fabricate_vat),
+    ("provider: explicit selection does not fallback by default", test_explicit_provider_does_not_fallback_by_default),
+    ("provider: explicit + allow_fallback=True falls back on quota", test_explicit_provider_with_allow_fallback_uses_backup),
+    ("provider: auto falls back on quota", test_auto_provider_falls_back_on_quota),
+    ("provider: quota error does not poison earlier quality result", test_provider_error_does_not_poison_quality_metrics),
+    ("provider: error classification (quota/auth/network/other)", test_provider_error_classification),
+    ("batch: summarize_batch separates provider failures from doc errors", test_summarize_batch_counts),
     ("acceptance: 3 reject-criteria scenarios through real xlsx export", test_reject_criteria_end_to_end_xlsx),
     ("status: diagnostic columns never gate status", test_diagnostic_keys_never_gate_status),
     ("currency: schema default is None", test_currency_default_is_none),

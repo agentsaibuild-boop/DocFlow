@@ -6,7 +6,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 from docflow.output import write_excel
-from docflow.pipeline import NoExtractorFound, extract
+from docflow.pipeline import NoExtractorFound, ProviderError, extract
 from docflow.registry import SupplierRegistry
 from docflow.schema import ExtractedDocument
 from docflow.status import compute_status
@@ -24,15 +24,24 @@ class BatchResult:
     enrich_findings: list
     validation_findings: list
     registry_findings: list
+    provider_error: str | None = None
+    provider_error_kind: str | None = None  # quota | auth | network | other
 
 
 def discover(folder: Path) -> list[Path]:
     return sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED)
 
 
-def process_one(path: Path, registry: SupplierRegistry, provider: str = "auto") -> BatchResult:
+def process_one(path: Path, registry: SupplierRegistry, provider: str = "auto",
+                allow_fallback: bool | None = None) -> BatchResult:
     try:
-        doc = extract(path, provider=provider)
+        doc = extract(path, provider=provider, allow_fallback=allow_fallback)
+    except ProviderError as pe:
+        # Provider/transport failure — keep separate from document validation.
+        return BatchResult(
+            path, None, None, None, [], [], [],
+            provider_error=str(pe), provider_error_kind=pe.kind,
+        )
     except Exception as e:
         return BatchResult(path, None, None, f"{type(e).__name__}: {e}", [], [], [])
 
@@ -49,7 +58,46 @@ def process_one(path: Path, registry: SupplierRegistry, provider: str = "auto") 
     )
 
 
-def run_batch(folder: Path, output_dir: Path, provider: str = "auto") -> list[BatchResult]:
+def summarize_batch(results: list[BatchResult]) -> dict:
+    """Aggregate batch counts, keeping provider failures separate from document quality.
+
+    Returned counts (mutually exclusive except 'processed'):
+      processed          — total files
+      extracted_ok       — supplier name + no validation errors
+      validation_errors  — supplier name + at least one validation error
+      no_data            — extraction succeeded but no supplier identified
+      provider_failures  — provider quota/auth/network/other (no doc produced)
+      unknown_errors     — non-provider exception during processing
+    """
+    processed = len(results)
+    provider_failures = sum(1 for r in results if r.provider_error)
+    unknown_errors = sum(1 for r in results if r.error)
+    validation_errors = 0
+    extracted_ok = 0
+    no_data = 0
+    for r in results:
+        if r.provider_error or r.error:
+            continue
+        if not (r.doc and r.doc.invoice and r.doc.invoice.supplier and r.doc.invoice.supplier.name):
+            no_data += 1
+            continue
+        if any(getattr(f, "level", None) == "error" for f in r.validation_findings):
+            validation_errors += 1
+        else:
+            extracted_ok += 1
+
+    return {
+        "processed": processed,
+        "extracted_ok": extracted_ok,
+        "validation_errors": validation_errors,
+        "no_data": no_data,
+        "provider_failures": provider_failures,
+        "unknown_errors": unknown_errors,
+    }
+
+
+def run_batch(folder: Path, output_dir: Path, provider: str = "auto",
+              allow_fallback: bool | None = None) -> list[BatchResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
     files = discover(folder)
     if not files:
@@ -58,8 +106,15 @@ def run_batch(folder: Path, output_dir: Path, provider: str = "auto") -> list[Ba
     results = []
     for f in files:
         print(f"[{len(results) + 1}/{len(files)}] {f.relative_to(folder)}", flush=True)
-        results.append(process_one(f, registry, provider=provider))
+        results.append(process_one(f, registry, provider=provider, allow_fallback=allow_fallback))
     write_consolidated(results, output_dir / "Фактури.xlsx")
+    summary = summarize_batch(results)
+    print(
+        "  done: processed={processed} extracted_ok={extracted_ok} "
+        "validation_errors={validation_errors} no_data={no_data} "
+        "provider_failures={provider_failures} unknown_errors={unknown_errors}".format(**summary),
+        flush=True,
+    )
     return results
 
 

@@ -101,6 +101,39 @@ def requires_iban(inv) -> bool:
     return False
 
 
+# Conservative list of clearly-foreign SaaS providers. Used only when the
+# supplier's origin can't be proven from VAT/EIK and the name itself is the
+# strongest evidence we have. Match is case-insensitive substring on
+# supplier.name. Never used to fabricate VAT numbers — only to decide that a
+# missing BG VAT is not a problem.
+_FOREIGN_SAAS_PROVIDERS = (
+    "github", "canva", "openai", "anthropic", "google",
+    "microsoft", "stripe",
+)
+
+
+def is_known_foreign_saas(inv) -> bool:
+    if inv is None or inv.supplier is None or not inv.supplier.name:
+        return False
+    name = inv.supplier.name.lower()
+    return any(p in name for p in _FOREIGN_SAAS_PROVIDERS)
+
+
+def _vat_required(inv) -> bool:
+    """Is a BG VAT number meaningfully required for this invoice?
+
+    Foreign suppliers obviously don't have BG VAT. Unknown-origin invoices
+    from clearly-foreign SaaS providers (matched by name) also don't.
+    Otherwise → required.
+    """
+    origin = supplier_origin(inv)
+    if origin == SupplierOrigin.FOREIGN:
+        return False
+    if origin == SupplierOrigin.UNKNOWN and is_known_foreign_saas(inv):
+        return False
+    return True
+
+
 def is_column_required_for(key: str, inv) -> bool:
     """Whether the column applies to this invoice's profile.
 
@@ -110,6 +143,8 @@ def is_column_required_for(key: str, inv) -> bool:
         return False
     if key == "supplier_iban":
         return requires_iban(inv)
+    if key == "supplier_vat":
+        return _vat_required(inv)
     return True
 
 
@@ -118,18 +153,35 @@ def compute_status(
     validation_findings,
     required_column_keys: list[str] | None = None,
     extraction_error: str | None = None,
+    provider_error: str | None = None,
+    provider_error_kind: str | None = None,
 ) -> StatusResult:
     """Decide a row status, with a WHY explanation in notes.
 
     Precedence (first match wins):
-      1. extraction_error → ERROR
-      2. invoice missing / supplier.name empty → NO_DATA
-      3. any validation finding with level=='error' → VALIDATION_ERROR
+      1. provider_error → PROVIDER_ERROR (separate from document quality)
+      2. extraction_error → ERROR (non-provider exception)
+      3. invoice missing / supplier.name empty → NO_DATA
+      4. any validation finding with level=='error' → VALIDATION_ERROR
          (math mismatches surface here and always win over completeness)
-      4. required_column_keys provided and some empty, after
+      5. required_column_keys provided and some empty, after
          supplier/payment-method exemptions → INCOMPLETE
-      5. otherwise → OK
+      6. otherwise → OK
     """
+    if provider_error:
+        kind = provider_error_kind or "other"
+        kind_label = {
+            "quota": "квота/503",
+            "auth": "автентикация",
+            "network": "мрежа/timeout",
+            "other": "грешка",
+        }.get(kind, kind)
+        return StatusResult(
+            code="PROVIDER_ERROR",
+            label=f"🔌 Provider ({kind_label})",
+            notes=f"Provider не върна резултат ({kind}). Документът не е тестван: {provider_error[:120]}",
+        )
+
     if extraction_error:
         return StatusResult(
             code="ERROR",

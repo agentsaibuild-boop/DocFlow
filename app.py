@@ -14,9 +14,9 @@ import streamlit as st
 from docflow.env import load_env_file
 load_env_file(Path(__file__).parent / ".env")
 
-from docflow.batch import BatchResult
+from docflow.batch import BatchResult, summarize_batch
 from docflow.columns import COLUMN_CATALOG, get_row_value
-from docflow.pipeline import AVAILABLE_PROVIDERS, extract, list_providers
+from docflow.pipeline import AVAILABLE_PROVIDERS, ProviderError, extract, list_providers
 from docflow.registry import SupplierRegistry
 from docflow.status import compute_status
 from docflow.validators import validate
@@ -42,6 +42,19 @@ with st.sidebar:
         index=default_idx,
         help="Кой API ще се ползва. 'auto' пробва всички по реда им.",
     )
+
+    if provider != "auto":
+        allow_fallback = st.checkbox(
+            "Fallback при квота/503 от избрания provider",
+            value=False,
+            help=(
+                "По подразбиране explicit избор означава „използвай само този”. "
+                "Включи това, ако предпочиташ да получиш резултат от друг "
+                "provider, вместо файлът да се маркира като provider грешка."
+            ),
+        )
+    else:
+        allow_fallback = None  # auto → пълна верига по подразбиране
 
     st.divider()
     st.subheader("📋 Колони за експорт")
@@ -82,8 +95,13 @@ tab_upload, tab_results, tab_registry = st.tabs(["📤 Качване", "📊 Р
 MAX_PARALLEL = 5
 
 
-def _process_single(name, get_bytes, get_path, provider):
-    """Worker: runs in thread, no Streamlit calls."""
+def _process_single(name, get_bytes, get_path, provider, allow_fallback):
+    """Worker: runs in thread, no Streamlit calls.
+
+    Returns ("ok", name, doc, None, None, None)  on success
+         or ("provider", name, None, None, kind, msg) for provider/transport failures
+         or ("err", name, None, msg, None, None)      for other exceptions
+    """
     tmp_path = get_path()
     cleanup = False
     if tmp_path is None:
@@ -92,20 +110,21 @@ def _process_single(name, get_bytes, get_path, provider):
             tmp_path = Path(tf.name)
         cleanup = True
     try:
-        doc = extract(tmp_path, provider=provider)
+        doc = extract(tmp_path, provider=provider, allow_fallback=allow_fallback)
         doc.source_path = name
-        return ("ok", name, doc, None)
+        return ("ok", name, doc, None, None, None)
+    except ProviderError as pe:
+        msg = str(pe).replace(str(tmp_path), name)
+        return ("provider", name, None, None, pe.kind, msg)
     except Exception as e:
         msg = str(e).replace(str(tmp_path), name)
-        if "All extractors failed" in msg or "Gemini still unavailable" in msg or "503" in msg:
-            msg = f"{provider} върна 503/quota. Пробвай пак или избери друг model."
-        return ("err", name, None, f"{type(e).__name__}: {msg}")
+        return ("err", name, None, f"{type(e).__name__}: {msg}", None, None)
     finally:
         if cleanup:
             tmp_path.unlink(missing_ok=True)
 
 
-def process_files(file_sources, registry, provider):
+def process_files(file_sources, registry, provider, allow_fallback):
     """file_sources: list of (display_name, get_bytes_callable, source_path_callable)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -116,7 +135,7 @@ def process_files(file_sources, registry, provider):
 
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
         futures = {
-            ex.submit(_process_single, name, get_bytes, get_path, provider): name
+            ex.submit(_process_single, name, get_bytes, get_path, provider, allow_fallback): name
             for name, get_bytes, get_path in file_sources
         }
         pending_results = []
@@ -125,13 +144,18 @@ def process_files(file_sources, registry, provider):
             name = futures[future]
             progress.progress(completed / total,
                               text=f"[{completed}/{total}] завършен: {name}")
-            status, name, doc, err = future.result()
-            pending_results.append((name, status, doc, err))
+            pending_results.append(future.result())
 
     name_to_order = {(name): i for i, (name, _, _) in enumerate(file_sources)}
-    pending_results.sort(key=lambda r: name_to_order.get(r[0], 999999))
+    pending_results.sort(key=lambda r: name_to_order.get(r[1], 999999))
 
-    for name, status, doc, err in pending_results:
+    for status, name, doc, err, perr_kind, perr_msg in pending_results:
+        if status == "provider":
+            results.append(BatchResult(
+                Path(name), None, None, None, [], [], [],
+                provider_error=perr_msg, provider_error_kind=perr_kind,
+            ))
+            continue
         if status == "err":
             results.append(BatchResult(Path(name), None, None, err, [], [], []))
             continue
@@ -233,17 +257,26 @@ with tab_upload:
 
     if process_btn and file_sources:
         registry = SupplierRegistry()
-        results = process_files(file_sources, registry, provider)
+        results = process_files(file_sources, registry, provider, allow_fallback)
         st.session_state["last_results"] = results
 
-        ok = sum(1 for r in results if r.error is None and r.doc and r.doc.invoice
-                 and r.doc.invoice.supplier and r.doc.invoice.supplier.name)
-        err = len(results) - ok
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Файлове", len(results))
-        col_b.metric("С пълни данни", ok)
-        col_c.metric("Изискват преглед", err)
+        summary = summarize_batch(results)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("📥 Обработени", summary["processed"])
+        c2.metric("✅ Извлечени OK", summary["extracted_ok"])
+        c3.metric("⚠️ Validation грешки", summary["validation_errors"])
+        c4, c5, c6 = st.columns(3)
+        c4.metric("⚪ Без данни", summary["no_data"])
+        c5.metric("🔌 Provider грешки", summary["provider_failures"])
+        c6.metric("❌ Други грешки", summary["unknown_errors"])
 
+        if summary["provider_failures"]:
+            st.warning(
+                f"🔌 {summary['provider_failures']} файла не са обработени поради "
+                f"provider грешка (квота/503/auth/мрежа). Те **не са** маркирани "
+                "като лоши документи — просто не са тествани. Пробвай отново "
+                "или включи fallback от sidebar-а."
+            )
         st.success("✅ Обработено. Виж раздел **Резултати** за детайли.")
 
 
@@ -259,7 +292,18 @@ with tab_results:
         rows = []
         for r in results:
             row = {"Файл": r.source.name}
-            if r.error:
+            if r.provider_error:
+                status = compute_status(
+                    None, [],
+                    provider_error=r.provider_error,
+                    provider_error_kind=r.provider_error_kind,
+                )
+                row["Статус"] = status.label
+                row["Метод"] = "—"
+                for col in selected:
+                    row[label_for[col]] = ""
+                row["Бележки"] = status.notes
+            elif r.error:
                 status = compute_status(None, [], extraction_error=r.error)
                 row["Статус"] = status.label
                 row["Метод"] = "—"
