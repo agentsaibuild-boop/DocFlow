@@ -315,9 +315,9 @@ def test_foreign_supplier_no_iban_not_incomplete():
         total_to_pay=10.0,
         currency="USD",
     )
-    # No VAT, no EIK → origin is UNKNOWN (honest), not falsely "foreign".
-    assert supplier_origin(inv) == SupplierOrigin.UNKNOWN
-    assert not requires_iban(inv), "unknown-origin + no payment_method → IBAN not required"
+    # Name matches VENDOR_PROFILES → deterministic FOREIGN (not UNKNOWN).
+    assert supplier_origin(inv) == SupplierOrigin.FOREIGN
+    assert not requires_iban(inv), "foreign + no payment_method → IBAN not required"
 
     required = [
         "supplier_name", "supplier_iban", "invoice_number", "invoice_date",
@@ -434,7 +434,7 @@ def test_supplier_vat_exempt_for_foreign_and_known_saas():
         customer=Party(name="Купувач"),
         net_amount=10.0, total_to_pay=10.0, currency="USD",
     )
-    assert supplier_origin(inv_gh) == SupplierOrigin.UNKNOWN
+    assert supplier_origin(inv_gh) == SupplierOrigin.FOREIGN
     assert is_known_foreign_saas(inv_gh)
     r1 = compute_status(_make_doc(inv_gh), [], required_column_keys=required)
     assert r1.code == "OK", f"GitHub expected OK, got {r1.code}: {r1.notes} (empty={r1.empty_columns})"
@@ -671,15 +671,13 @@ def test_summarize_batch_counts():
         BatchResult(_P("crash.pdf"), None, None, "ValueError: bad data", [], [], []),
     ]
     s = summarize_batch(results)
-    assert s == {
-        "processed": 6,
-        "extracted_ok": 1,
-        "validation_errors": 1,
-        "no_data": 1,
-        "provider_failures": 2,
-        "unknown_errors": 1,
-    }, s
-    return str(s)
+    counts = {k: s[k] for k in ("processed", "extracted_ok", "validation_errors",
+                                 "no_data", "provider_failures", "unknown_errors")}
+    assert counts == {
+        "processed": 6, "extracted_ok": 1, "validation_errors": 1,
+        "no_data": 1, "provider_failures": 2, "unknown_errors": 1,
+    }, counts
+    return str(counts)
 
 
 def test_reject_criteria_end_to_end_xlsx():
@@ -1096,6 +1094,439 @@ def test_env_loader_respects_existing_env():
 
 # ─── Runner ─────────────────────────────────────────────────────────────────
 
+def test_derived_signals_get_discounted():
+    """A signal whose substrate is in derived_fields must contribute less than
+    the same signal grounded in extraction. Coverage stays full; confidence
+    drops."""
+    from docflow.pipeline import _derive_missing_totals
+    from docflow.quality import (
+        _DERIVATION_DISCOUNT, invoice_quality_breakdown, invoice_quality_coverage,
+    )
+    from docflow.schema import InvoiceData, LineItem, Party, VatBreakdown
+
+    # Path 1: line_items + net_amount + total_to_pay + vat_breakdown all EXTRACTED.
+    inv_extracted = InvoiceData(
+        invoice_number="X", issue_date="2026-01-01",
+        supplier=Party(name="X", eik="123456789"),
+        customer=Party(name="Y"),
+        line_items=[LineItem(total_without_vat=100, vat_percent=20)],
+        net_amount=100.0,
+        total_to_pay=120.0,
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=100, vat_amount=20)],
+        currency="BGN",
+    )
+    score_ex, bd_ex = invoice_quality_breakdown(inv_extracted)
+    cov_ex = invoice_quality_coverage(inv_extracted)
+
+    # Path 2: same signal set but totals + vat_breakdown DERIVED from line_items.
+    inv_derived = InvoiceData(
+        invoice_number="X", issue_date="2026-01-01",
+        supplier=Party(name="X", eik="123456789"),
+        customer=Party(name="Y"),
+        line_items=[LineItem(total_without_vat=100, vat_percent=20)],
+        currency="BGN",
+    )
+    _derive_missing_totals(inv_derived)
+    # After derivation: net_amount, total_to_pay, vat_breakdown all in derived_fields.
+    assert "net_amount" in inv_derived.derived_fields
+    assert "total_to_pay" in inv_derived.derived_fields
+    assert "vat_info" not in inv_derived.derived_fields  # vat_breakdown stored under that key
+    assert "vat_breakdown" in inv_derived.derived_fields
+
+    score_d, bd_d = invoice_quality_breakdown(inv_derived)
+    cov_d = invoice_quality_coverage(inv_derived)
+
+    assert score_d < score_ex, f"derived score {score_d} should be < extracted {score_ex}"
+    assert cov_d == cov_ex, f"coverage should be equal: extracted={cov_ex}, derived={cov_d}"
+    assert "any_total(derived)" in bd_d
+    assert "vat_info(derived)" in bd_d
+    assert bd_d["any_total(derived)"] == round(0.15 * _DERIVATION_DISCOUNT, 4)
+    return f"extracted_conf={score_ex}, derived_conf={score_d}, coverage_both={cov_ex}"
+
+
+def test_coverage_and_confidence_are_different_concepts():
+    """When all signals are derived from a single line item, coverage should
+    still be high (we know everything) but confidence should be lower."""
+    from docflow.pipeline import _derive_missing_totals
+    from docflow.quality import invoice_quality_breakdown
+    from docflow.schema import InvoiceData, LineItem, Party
+
+    inv = InvoiceData(
+        invoice_number="X", issue_date="2026-01-01",
+        supplier=Party(name="X", eik="123456789"),
+        customer=Party(name="Y"),
+        line_items=[LineItem(total_without_vat=100, vat_percent=20)],
+        currency="BGN",
+    )
+    _derive_missing_totals(inv)
+    score, bd = invoice_quality_breakdown(inv)
+    coverage = bd["_coverage"]
+    confidence = bd["_confidence"]
+    assert coverage > confidence, f"coverage={coverage} must exceed confidence={confidence}"
+    return f"coverage={coverage}, confidence={confidence}"
+
+
+def test_vendor_registry_is_structured_not_inline():
+    """vendor_registry exposes a real dataclass with explicit name_patterns,
+    not a substring-keyed dict."""
+    from docflow.vendor_registry import VENDORS, VendorOrigin, VendorProfile, lookup_vendor
+
+    assert isinstance(VENDORS, tuple)
+    for v in VENDORS:
+        assert isinstance(v, VendorProfile)
+        assert isinstance(v.name_patterns, tuple) and len(v.name_patterns) >= 1
+        assert v.origin in (VendorOrigin.FOREIGN, VendorOrigin.BG, VendorOrigin.UNKNOWN)
+
+    # Lookup works case-insensitively and substring-matched.
+    assert lookup_vendor("GitHub, Inc.").key == "github"
+    assert lookup_vendor("microsoft ireland operations").key == "microsoft"
+    assert lookup_vendor("Райкомерс ЕООД") is None
+    assert lookup_vendor("") is None
+    assert lookup_vendor(None) is None
+    return f"{len(VENDORS)} structured vendor profiles"
+
+
+def test_summarize_batch_per_provider_stats():
+    """summarize_batch returns per-provider averages including latency."""
+    from docflow.batch import BatchResult, summarize_batch
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+    from pathlib import Path as _P
+
+    def _result(name, method, score, coverage, lat):
+        inv = InvoiceData(
+            invoice_number=name, issue_date="2026-01-01",
+            supplier=Party(name="X", eik="123456789"),
+        )
+        doc = ExtractedDocument(
+            source_path=name, extraction_method=method, page_count=1, invoice=inv,
+            quality_score=score, quality_coverage=coverage,
+        )
+        return BatchResult(_P(name), None, doc, None, [], [], [], processing_time_s=lat)
+
+    results = [
+        _result("f1.pdf", "gemini:gemini-3.1-flash-lite", 0.90, 0.95, 7.0),
+        _result("f2.pdf", "gemini:gemini-3.1-flash-lite", 0.80, 0.90, 8.0),
+        _result("f3.pdf", "qwen_3_vl_235b:qwen3-vl-235b-a22b-instruct", 1.00, 1.00, 25.0),
+        BatchResult(_P("q.pdf"), None, None, None, [], [], [],
+                    provider_error="[gemini/quota] x", provider_error_kind="quota",
+                    processing_time_s=2.0),
+    ]
+    s = summarize_batch(results)
+    assert s["processed"] == 4
+    assert s["provider_failures"] == 1
+    assert s["extracted_ok"] == 3
+    assert "per_provider" in s
+    gp = s["per_provider"]["gemini"]
+    assert gp["files"] == 2
+    assert gp["avg_score"] == 0.85
+    assert gp["avg_latency_s"] == 7.5
+    qp = s["per_provider"]["qwen_3_vl_235b"]
+    assert qp["files"] == 1 and qp["avg_score"] == 1.0 and qp["avg_latency_s"] == 25.0
+    return f"providers in summary: {sorted(s['per_provider'])}"
+
+
+def test_benchmark_registry_only_lists_real_measurements():
+    """The benchmark registry must contain only providers we've actually
+    measured. Required fields populated; values in plausible ranges; only
+    providers present in PROVIDER_ALIASES."""
+    from docflow.eval.benchmarks import BENCHMARKS, benchmarks_as_rows, get_benchmark
+    from docflow.pipeline import PROVIDER_ALIASES
+
+    assert len(BENCHMARKS) > 0, "expected at least one benchmarked provider"
+
+    for b in BENCHMARKS:
+        assert b.provider in PROVIDER_ALIASES, \
+            f"benchmark for unknown provider: {b.provider}"
+        assert b.invoice_count > 0, b.provider
+        assert 0.0 <= b.avg_quality_score <= 1.0, (b.provider, b.avg_quality_score)
+        assert 0.0 <= b.supplier_accuracy <= 1.0, (b.provider, b.supplier_accuracy)
+        assert 0.0 <= b.success_rate <= 1.0, (b.provider, b.success_rate)
+        assert b.avg_latency_s >= 0, (b.provider, b.avg_latency_s)
+        assert b.notes, f"{b.provider}: empty notes"
+        assert b.measured_at, f"{b.provider}: empty measured_at"
+        # Lookup round-trip
+        assert get_benchmark(b.provider) is b
+
+    # Untested providers must return None — not a stub or fabricated record.
+    assert get_benchmark("definitely_not_a_real_provider") is None
+
+    # benchmarks_as_rows must produce display-ready dicts.
+    rows = benchmarks_as_rows()
+    assert len(rows) == len(BENCHMARKS)
+    for r in rows:
+        assert "Provider" in r and "Quality score" in r and "Latency (s)" in r
+    return f"{len(BENCHMARKS)} provider benchmarks; {len(PROVIDER_ALIASES) - len(BENCHMARKS)} untested"
+
+
+def test_eval_truth_schema_and_discovery():
+    from docflow.eval.truth import (
+        CRITICAL_FIELDS, InvoiceTruth, TRUTH_FIELDS, discover_dataset,
+        truth_path_for,
+    )
+
+    truth = InvoiceTruth(
+        supplier_name="X", supplier_eik="123456789",
+        iban="BG80BNBG96611020345678", total_to_pay=120.0,
+    )
+    assert truth.supplier_name == "X"
+    assert "supplier_eik" in TRUTH_FIELDS
+    assert "supplier_eik" in CRITICAL_FIELDS
+
+    # truth_path_for must produce a sibling .truth.json
+    p = Path("/x/invoice_001.pdf")
+    assert truth_path_for(p).name == "invoice_001.truth.json"
+
+    # discover_dataset returns only files with matching sidecars
+    import tempfile as _t
+    with _t.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "a.pdf").write_bytes(b"")
+        (td / "a.truth.json").write_text('{"supplier_name": "X"}')
+        (td / "b.pdf").write_bytes(b"")  # no truth
+        pairs = discover_dataset(td)
+        names = [p.name for p, _ in pairs]
+        assert names == ["a.pdf"], names
+    return f"{len(TRUTH_FIELDS)} truth fields, {len(CRITICAL_FIELDS)} critical"
+
+
+def test_eval_compare_invoice_matches_and_mismatches():
+    """compare_invoice produces correct per-field statuses."""
+    from docflow.eval.metrics import compare_invoice
+    from docflow.eval.truth import InvoiceTruth
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    truth = InvoiceTruth(
+        supplier_name="ООД Тест",
+        supplier_eik="123456789",
+        iban="BG80BNBG96611020345678",
+        invoice_number="2026/0001",
+        net_amount=100.0,
+        total_to_pay=120.0,
+    )
+    inv = InvoiceData(
+        invoice_number="2026/0001",                 # exact match
+        supplier=Party(name="ООД  Тест", eik="123456789"),  # normalized (extra space)
+        iban="BG80BNBG96611020345678",              # exact match
+        net_amount=100.0,                            # exact match
+        total_to_pay=99.99,                          # mismatch (>tolerance)
+        # supplier_vat missing in truth → not_in_truth
+    )
+    doc = ExtractedDocument(source_path="x", extraction_method="t", page_count=1, invoice=inv)
+    comp = compare_invoice(doc, truth, invoice_file="x.pdf", provider="test")
+
+    by_field = {f.field: f for f in comp.fields}
+    assert by_field["invoice_number"].status == "exact_match"
+    assert by_field["supplier_name"].status == "normalized_match"
+    assert by_field["supplier_eik"].status == "exact_match"
+    assert by_field["iban"].status == "exact_match"
+    assert by_field["net_amount"].status == "exact_match"
+    assert by_field["total_to_pay"].status == "mismatch", \
+        f"99.99 vs 120.0 should mismatch, got {by_field['total_to_pay'].status}"
+    assert by_field["supplier_vat"].status == "not_in_truth"
+
+    # Critical-field flag is set for all 5 critical fields.
+    critical = [f for f in comp.fields if f.critical]
+    assert {f.field for f in critical} == {
+        "supplier_eik", "supplier_vat", "iban", "total_to_pay", "net_amount",
+    }
+    return "exact/normalized/mismatch/not_in_truth all detected"
+
+
+def test_eval_distinguishes_hallucinated_from_not_in_truth():
+    """Explicit null in truth + extracted value → 'hallucinated'.
+    Missing key in truth → 'not_in_truth' (not graded)."""
+    import tempfile as _t
+
+    from docflow.eval.metrics import compare_invoice
+    from docflow.eval.truth import load_truth
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    # Truth: supplier_vat explicitly null; supplier_eik present; iban omitted.
+    truth_json = '{"supplier_eik": "123456789", "supplier_vat": null}'
+    with _t.NamedTemporaryFile(suffix=".truth.json", mode="w", delete=False) as fh:
+        fh.write(truth_json)
+        path = Path(fh.name)
+    try:
+        truth = load_truth(path)
+        assert truth.has_field("supplier_vat") is True   # explicitly null
+        assert truth.has_field("supplier_eik") is True
+        assert truth.has_field("iban") is False           # omitted
+    finally:
+        path.unlink()
+
+    # Extracted produces a VAT (hallucinated against explicit null).
+    inv = InvoiceData(supplier=Party(eik="123456789", vat_number="BG999999999"),
+                      iban="BG80BNBG96611020345678")
+    doc = ExtractedDocument(source_path="x", extraction_method="t", page_count=1, invoice=inv)
+    comp = compare_invoice(doc, truth, invoice_file="x.pdf", provider="p")
+    by_f = {f.field: f for f in comp.fields}
+    assert by_f["supplier_eik"].status == "exact_match"
+    assert by_f["supplier_vat"].status == "hallucinated", by_f["supplier_vat"].status
+    assert by_f["iban"].status == "not_in_truth", by_f["iban"].status
+    return f"vat→hallucinated, iban→not_in_truth"
+
+
+def test_eval_per_field_confidence_populated():
+    """Each FieldComparison carries a confidence from quality breakdown."""
+    from docflow.eval.metrics import compare_invoice
+    from docflow.eval.truth import InvoiceTruth
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    truth = InvoiceTruth(
+        supplier_eik="123456789", supplier_vat="BG123456789",
+        net_amount=100.0, total_to_pay=120.0, iban="BG80BNBG96611020345678",
+    )
+    truth._present_keys = {"supplier_eik", "supplier_vat", "net_amount",
+                           "total_to_pay", "iban"}
+    inv = InvoiceData(
+        invoice_number="X",
+        supplier=Party(name="X", eik="123456789", vat_number="BG123456789"),
+        iban="BG80BNBG96611020345678",
+        net_amount=100.0, total_to_pay=120.0, currency="BGN",
+    )
+    doc = ExtractedDocument(source_path="x", extraction_method="t", page_count=1, invoice=inv)
+    comp = compare_invoice(doc, truth, invoice_file="x.pdf", provider="p")
+    by_f = {f.field: f for f in comp.fields}
+
+    # supplier_eik and supplier_vat split supplier_tax_id (0.10 weight) evenly: 0.05 each.
+    assert by_f["supplier_eik"].confidence == 0.05, by_f["supplier_eik"].confidence
+    assert by_f["supplier_vat"].confidence == 0.05
+    # net_amount and total_to_pay split any_total (0.15) → 0.075 each.
+    assert by_f["net_amount"].confidence == 0.075
+    assert by_f["total_to_pay"].confidence == 0.075
+    # iban has its own signal (0.05) → full weight.
+    assert by_f["iban"].confidence == 0.05
+    return "per-field confidences from breakdown signals"
+
+
+def test_eval_aggregate_metrics_critical_and_wbc():
+    """Aggregate correctly computes critical_field_accuracy and
+    wrong_but_confident_rate."""
+    from docflow.eval.metrics import aggregate, compare_invoice
+    from docflow.eval.truth import InvoiceTruth
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    truth = InvoiceTruth(supplier_eik="123456789", total_to_pay=100.0,
+                         net_amount=80.0, iban="BG80BNBG96611020345678",
+                         supplier_vat="BG123456789")
+
+    # 1) Correct extraction, score 0.95 → matched, NOT wrong-but-confident.
+    inv_ok = InvoiceData(
+        supplier=Party(name="X", eik="123456789", vat_number="BG123456789"),
+        iban="BG80BNBG96611020345678",
+        net_amount=80.0, total_to_pay=100.0,
+    )
+    doc_ok = ExtractedDocument(source_path="ok", extraction_method="t",
+                               page_count=1, invoice=inv_ok, quality_score=0.95)
+
+    # 2) Wrong total but high score → wrong-but-confident.
+    inv_wbc = InvoiceData(
+        supplier=Party(name="X", eik="123456789", vat_number="BG123456789"),
+        iban="BG80BNBG96611020345678",
+        net_amount=80.0, total_to_pay=999.0,
+    )
+    doc_wbc = ExtractedDocument(source_path="wbc", extraction_method="t",
+                                page_count=1, invoice=inv_wbc, quality_score=0.85)
+
+    # 3) Low score, several misses → does NOT count toward wbc rate.
+    inv_low = InvoiceData(supplier=Party(name="X"))
+    doc_low = ExtractedDocument(source_path="low", extraction_method="t",
+                                page_count=1, invoice=inv_low, quality_score=0.15)
+
+    cs = [
+        compare_invoice(doc_ok,  truth, invoice_file="a.pdf", provider="p"),
+        compare_invoice(doc_wbc, truth, invoice_file="b.pdf", provider="p"),
+        compare_invoice(doc_low, truth, invoice_file="c.pdf", provider="p"),
+    ]
+    a = aggregate(cs, "p")
+    assert a.invoice_count == 3
+    # Invoice acc: only doc_ok matches all graded fields. doc_low matches 0 graded.
+    assert a.invoice_accuracy == round(1/3, 4), a.invoice_accuracy
+    # Critical fields graded per invoice = 5 (eik, vat, iban, net_amount, total_to_pay).
+    # doc_ok matches 5/5; doc_wbc matches 4/5 (total wrong); doc_low matches 0/5 (all missing).
+    # 5+4+0 = 9 of 15 graded critical cells.
+    expected_crit = round(9/15, 4)
+    assert a.critical_field_accuracy == expected_crit, (a.critical_field_accuracy, expected_crit)
+    # Wrong-but-confident: confident invoices are doc_ok and doc_wbc (≥0.7).
+    # doc_ok matched all → not wrong. doc_wbc has mismatch → wrong-but-confident.
+    assert a.wrong_but_confident_rate == 0.5, a.wrong_but_confident_rate
+    return f"invoice_acc={a.invoice_accuracy}, crit_acc={a.critical_field_accuracy}, wbc={a.wrong_but_confident_rate}"
+
+
+def test_eval_report_writes_all_four_files():
+    """write_all produces json + md + csv + xlsx."""
+    from openpyxl import load_workbook
+
+    from docflow.eval.metrics import aggregate, compare_invoice
+    from docflow.eval.report import write_all
+    from docflow.eval.runner import EvaluationResult
+    from docflow.eval.truth import InvoiceTruth
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+
+    truth = InvoiceTruth(supplier_name="X", supplier_eik="123456789")
+    inv = InvoiceData(supplier=Party(name="X", eik="123456789"))
+    doc = ExtractedDocument(source_path="x", extraction_method="t", page_count=1, invoice=inv,
+                            quality_score=0.6, quality_coverage=0.7)
+    cs = [compare_invoice(doc, truth, invoice_file="x.pdf", provider="prov")]
+    result = EvaluationResult(
+        started_at="2026-05-18T00:00:00", dataset_dir="/x", providers=["prov"],
+        invoices=cs, per_provider={"prov": aggregate(cs, "prov")}, sample_count=1,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        paths = write_all(result, Path(td), basename="test_eval")
+        for kind, p in paths.items():
+            assert p.exists() and p.stat().st_size > 0, f"empty: {kind}"
+        wb = load_workbook(paths["xlsx"])
+        assert set(wb.sheetnames) >= {"Summary", "Critical fields", "All fields", "Per-invoice", "Fields"}
+        md_text = paths["md"].read_text(encoding="utf-8")
+        assert "DocFlow Evaluation Report" in md_text
+        assert "Critical-field accuracy" in md_text
+    return "json + md + csv + xlsx written"
+
+
+def test_eval_regression_diff_surfaces_deltas():
+    from docflow.eval.regression import regression_report
+
+    prev = {
+        "started_at": "2026-05-17T10:00:00",
+        "dataset_dir": "/x",
+        "per_provider": {
+            "prov": {
+                "invoice_accuracy": 0.50, "critical_field_accuracy": 0.60,
+                "hallucination_rate": 0.30, "wrong_but_confident_rate": 0.20,
+                "avg_quality_score": 0.70,
+                "critical_field_accuracy_per_field": {
+                    "supplier_eik": 0.5, "supplier_vat": 0.5, "iban": 0.6,
+                    "total_to_pay": 0.7, "net_amount": 0.7,
+                },
+            }
+        },
+        "invoices": [{"invoice_file": "a.pdf", "provider": "prov", "extracted_quality_score": 0.40}],
+    }
+    curr = {
+        "started_at": "2026-05-18T10:00:00",
+        "dataset_dir": "/x",
+        "per_provider": {
+            "prov": {
+                "invoice_accuracy": 0.80, "critical_field_accuracy": 0.85,
+                "hallucination_rate": 0.10, "wrong_but_confident_rate": 0.05,
+                "avg_quality_score": 0.90,
+                "critical_field_accuracy_per_field": {
+                    "supplier_eik": 0.9, "supplier_vat": 0.9, "iban": 0.8,
+                    "total_to_pay": 0.85, "net_amount": 0.85,
+                },
+            }
+        },
+        "invoices": [{"invoice_file": "a.pdf", "provider": "prov", "extracted_quality_score": 0.95}],
+    }
+    md = regression_report(prev, curr)
+    assert "+30.0pp" in md  # invoice_accuracy delta
+    assert "+25.0pp" in md  # critical_field_accuracy delta
+    assert "-20.0pp" in md  # halluc rate dropped (good)
+    assert "+0.55" in md    # per-file score change for a.pdf
+    return "deltas surface in diff"
+
+
 TESTS: list[tuple[str, Callable]] = [
     ("schema imports + is_useful_invoice", test_schema_imports),
     ("pipeline registers extractors with pdfplumber first", test_pipeline_registers_extractors),
@@ -1112,6 +1543,18 @@ TESTS: list[tuple[str, Callable]] = [
     ("registry: record/enrich do not mutate input", test_registry_does_not_mutate_input),
     ("registry: auto-fill missing fields on subsequent invoice", test_registry_auto_fills_missing_fields),
     ("registry: enrich replaces hallucinated IBAN", test_registry_enrich_overrides_mismatch),
+    ("calibration: derived signals get half-weight discount", test_derived_signals_get_discounted),
+    ("calibration: coverage > confidence when signals are derived", test_coverage_and_confidence_are_different_concepts),
+    ("calibration: vendor registry is structured, not inline-spaghetti", test_vendor_registry_is_structured_not_inline),
+    ("calibration: summarize_batch returns per-provider stats", test_summarize_batch_per_provider_stats),
+    ("eval: truth schema + discover_dataset finds (invoice, truth) pairs", test_eval_truth_schema_and_discovery),
+    ("eval: compare_invoice detects exact/normalized/mismatch/missing", test_eval_compare_invoice_matches_and_mismatches),
+    ("benchmark registry only lists real measurements", test_benchmark_registry_only_lists_real_measurements),
+    ("eval: hallucinated status differs from not_in_truth", test_eval_distinguishes_hallucinated_from_not_in_truth),
+    ("eval: FieldComparison carries per-field confidence", test_eval_per_field_confidence_populated),
+    ("eval: aggregate computes critical-field and wrong-but-confident rates", test_eval_aggregate_metrics_critical_and_wbc),
+    ("eval: write_all produces json + md + csv + xlsx", test_eval_report_writes_all_four_files),
+    ("eval: regression diff surfaces top-line + per-file deltas", test_eval_regression_diff_surfaces_deltas),
     ("provenance: derived_fields not in JSON schema", test_derived_fields_not_in_json_schema),
     ("provenance: derivation still records via PrivateAttr", test_derived_fields_provenance_still_records),
     ("status: foreign supplier without IBAN is not INCOMPLETE", test_foreign_supplier_no_iban_not_incomplete),

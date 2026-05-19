@@ -89,7 +89,8 @@ class ExtractedDocument(BaseModel):
     tables: list[ExtractedTable] = Field(default_factory=list)
     full_text: str = ""
     invoice: InvoiceData | None = None
-    quality_score: float = 0.0
+    quality_score: float = 0.0     # confidence: extraction-vs-derivation discounted, validation-capped
+    quality_coverage: float = 0.0  # how many signals are present; no discount, no cap
 
     @property
     def name(self) -> str:

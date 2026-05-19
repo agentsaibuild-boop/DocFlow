@@ -1,0 +1,6 @@
+{
+  "supplier_name": "ООД Тест",
+  "invoice_number": "2026/0001",
+  "iban": "BG80BNBG96611020345678",
+  "notes": "Sample built-by-pdfplumber digital invoice from samples/test_invoice.pdf. Used to smoke-test the eval framework, not a real-world benchmark file. Truth values reflect what was visible in the document during initial extraction."
+}

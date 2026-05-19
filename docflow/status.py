@@ -18,9 +18,10 @@ from docflow.columns import get_row_value
 # the status decision.
 DIAGNOSTIC_KEYS = {
     "quality_score",
+    "quality_breakdown",
     "validation_errors",
     "registry_status",
-    "is_derived",
+    "derived_fields",
 }
 
 
@@ -57,6 +58,8 @@ def supplier_origin(inv) -> SupplierOrigin:
     Proof:
       • VAT prefix is a two-letter alpha country code: BG → BG, anything else → FOREIGN.
       • No VAT, but BG EIK present (9/10/13 BG digits) → BG.
+      • No VAT/EIK, but supplier name matches a known foreign SaaS vendor
+        (VENDOR_PROFILES) → FOREIGN, deterministically.
       • Otherwise → UNKNOWN. (Currency alone is not proof — a BG supplier may bill in EUR/USD.)
     """
     if inv is None or inv.supplier is None:
@@ -68,6 +71,13 @@ def supplier_origin(inv) -> SupplierOrigin:
         return SupplierOrigin.FOREIGN
     if inv.supplier.eik:
         return SupplierOrigin.BG
+    profile = vendor_profile(inv)
+    if profile is not None:
+        return {
+            VendorOrigin.BG: SupplierOrigin.BG,
+            VendorOrigin.FOREIGN: SupplierOrigin.FOREIGN,
+            VendorOrigin.UNKNOWN: SupplierOrigin.UNKNOWN,
+        }[profile.origin]
     return SupplierOrigin.UNKNOWN
 
 
@@ -101,37 +111,34 @@ def requires_iban(inv) -> bool:
     return False
 
 
-# Conservative list of clearly-foreign SaaS providers. Used only when the
-# supplier's origin can't be proven from VAT/EIK and the name itself is the
-# strongest evidence we have. Match is case-insensitive substring on
-# supplier.name. Never used to fabricate VAT numbers — only to decide that a
-# missing BG VAT is not a problem.
-_FOREIGN_SAAS_PROVIDERS = (
-    "github", "canva", "openai", "anthropic", "google",
-    "microsoft", "stripe",
-)
+from docflow.vendor_registry import VENDORS, VendorOrigin, VendorProfile, lookup_vendor
+
+# Re-export for callers that imported VENDOR_PROFILES before the refactor.
+VENDOR_PROFILES = {v.key: v for v in VENDORS}
+
+
+def vendor_profile(inv) -> VendorProfile | None:
+    """Return the matched VendorProfile, or None. Wraps lookup_vendor with the
+    invoice signature the rest of the module expects."""
+    if inv is None or inv.supplier is None:
+        return None
+    return lookup_vendor(inv.supplier.name)
 
 
 def is_known_foreign_saas(inv) -> bool:
-    if inv is None or inv.supplier is None or not inv.supplier.name:
-        return False
-    name = inv.supplier.name.lower()
-    return any(p in name for p in _FOREIGN_SAAS_PROVIDERS)
+    """Backward-compat boolean for callers that don't need the full profile."""
+    p = vendor_profile(inv)
+    return p is not None and p.origin == VendorOrigin.FOREIGN
 
 
 def _vat_required(inv) -> bool:
-    """Is a BG VAT number meaningfully required for this invoice?
+    """BG VAT is meaningful only when the supplier is definitively Bulgarian.
 
-    Foreign suppliers obviously don't have BG VAT. Unknown-origin invoices
-    from clearly-foreign SaaS providers (matched by name) also don't.
-    Otherwise → required.
+    FOREIGN and UNKNOWN origins → not required. supplier_origin() already
+    routes known foreign SaaS vendors to FOREIGN, so the check collapses to
+    a single comparison.
     """
-    origin = supplier_origin(inv)
-    if origin == SupplierOrigin.FOREIGN:
-        return False
-    if origin == SupplierOrigin.UNKNOWN and is_known_foreign_saas(inv):
-        return False
-    return True
+    return supplier_origin(inv) == SupplierOrigin.BG
 
 
 def is_column_required_for(key: str, inv) -> bool:
@@ -228,7 +235,14 @@ def compute_status(
         SupplierOrigin.FOREIGN: "чуждестранен",
         SupplierOrigin.UNKNOWN: "произход неясен",
     }[origin]
-    iban_note = "IBAN изискван" if requires_iban(inv) else "IBAN неприложим"
+    # IBAN note: never claim "неприложим" when the IBAN is actually present.
+    # That would contradict the row's own data.
+    if inv.iban:
+        iban_note = "IBAN присъства"
+    elif requires_iban(inv):
+        iban_note = "IBAN изискван"  # status branch would normally INCOMPLETE; safety net.
+    else:
+        iban_note = "IBAN неприложим"
     return StatusResult(
         code="OK",
         label="✅ OK",

@@ -26,6 +26,7 @@ class BatchResult:
     registry_findings: list
     provider_error: str | None = None
     provider_error_kind: str | None = None  # quota | auth | network | other
+    processing_time_s: float | None = None  # wall-clock for extract+validate+registry
 
 
 def discover(folder: Path) -> list[Path]:
@@ -34,16 +35,21 @@ def discover(folder: Path) -> list[Path]:
 
 def process_one(path: Path, registry: SupplierRegistry, provider: str = "auto",
                 allow_fallback: bool | None = None) -> BatchResult:
+    import time
+    t0 = time.time()
     try:
         doc = extract(path, provider=provider, allow_fallback=allow_fallback)
     except ProviderError as pe:
-        # Provider/transport failure — keep separate from document validation.
         return BatchResult(
             path, None, None, None, [], [], [],
             provider_error=str(pe), provider_error_kind=pe.kind,
+            processing_time_s=round(time.time() - t0, 2),
         )
     except Exception as e:
-        return BatchResult(path, None, None, f"{type(e).__name__}: {e}", [], [], [])
+        return BatchResult(
+            path, None, None, f"{type(e).__name__}: {e}", [], [], [],
+            processing_time_s=round(time.time() - t0, 2),
+        )
 
     enrich_findings = []
     if doc.invoice:
@@ -52,22 +58,41 @@ def process_one(path: Path, registry: SupplierRegistry, provider: str = "auto",
     validation_findings = validate(doc)
     registry_findings = registry.record(doc.invoice, human_confirmed=False) if doc.invoice else []
 
+    from docflow.quality import invoice_quality_coverage, invoice_quality_score
+    doc.quality_score = invoice_quality_score(doc.invoice, validation_findings)
+    doc.quality_coverage = invoice_quality_coverage(doc.invoice)
+
     return BatchResult(
         path, None, doc, None,
         enrich_findings, validation_findings, registry_findings,
+        processing_time_s=round(time.time() - t0, 2),
     )
 
 
-def summarize_batch(results: list[BatchResult]) -> dict:
-    """Aggregate batch counts, keeping provider failures separate from document quality.
+def _provider_name_from_method(method: str) -> str:
+    """Strip model variant suffix to get the underlying provider/extractor name.
 
-    Returned counts (mutually exclusive except 'processed'):
-      processed          — total files
-      extracted_ok       — supplier name + no validation errors
-      validation_errors  — supplier name + at least one validation error
-      no_data            — extraction succeeded but no supplier identified
-      provider_failures  — provider quota/auth/network/other (no doc produced)
-      unknown_errors     — non-provider exception during processing
+    'gemini:gemini-3.1-flash-lite' → 'gemini'
+    'pdfplumber+gemini_text'       → 'pdfplumber'
+    'qwen_3_vl_235b:qwen3-vl-235b' → 'qwen_3_vl_235b'
+    """
+    base = method.split("+")[0]
+    base = base.split(":")[0]
+    return base
+
+
+def summarize_batch(results: list[BatchResult]) -> dict:
+    """Aggregate batch counts. Provider failures are kept separate from
+    document quality. Per-provider stats included for inspection.
+
+    Top-level (mutually exclusive except 'processed'):
+      processed, extracted_ok, validation_errors, no_data,
+      provider_failures, unknown_errors
+
+    per_provider: {provider_name: {files, avg_score, avg_coverage,
+                                   validation_errors, avg_latency_s}}
+    Only successful extractions contribute to per_provider averages; provider
+    failures are counted globally.
     """
     processed = len(results)
     provider_failures = sum(1 for r in results if r.provider_error)
@@ -75,16 +100,44 @@ def summarize_batch(results: list[BatchResult]) -> dict:
     validation_errors = 0
     extracted_ok = 0
     no_data = 0
+
+    per_provider: dict[str, dict] = {}
+
     for r in results:
         if r.provider_error or r.error:
             continue
         if not (r.doc and r.doc.invoice and r.doc.invoice.supplier and r.doc.invoice.supplier.name):
             no_data += 1
             continue
-        if any(getattr(f, "level", None) == "error" for f in r.validation_findings):
+
+        has_validation_error = any(getattr(f, "level", None) == "error" for f in r.validation_findings)
+        if has_validation_error:
             validation_errors += 1
         else:
             extracted_ok += 1
+
+        provider = _provider_name_from_method(r.doc.extraction_method)
+        s = per_provider.setdefault(provider, {
+            "files": 0, "_score_sum": 0.0, "_coverage_sum": 0.0,
+            "validation_errors": 0, "_latency_sum": 0.0, "_latency_count": 0,
+        })
+        s["files"] += 1
+        s["_score_sum"] += r.doc.quality_score
+        s["_coverage_sum"] += getattr(r.doc, "quality_coverage", 0.0)
+        if has_validation_error:
+            s["validation_errors"] += 1
+        if r.processing_time_s is not None:
+            s["_latency_sum"] += r.processing_time_s
+            s["_latency_count"] += 1
+
+    # Finalize per-provider averages, drop internal accumulators.
+    for provider, s in per_provider.items():
+        n = s["files"]
+        s["avg_score"]    = round(s["_score_sum"] / n, 3) if n else 0.0
+        s["avg_coverage"] = round(s["_coverage_sum"] / n, 3) if n else 0.0
+        s["avg_latency_s"] = round(s["_latency_sum"] / s["_latency_count"], 2) if s["_latency_count"] else None
+        for k in ("_score_sum", "_coverage_sum", "_latency_sum", "_latency_count"):
+            del s[k]
 
     return {
         "processed": processed,
@@ -93,6 +146,7 @@ def summarize_batch(results: list[BatchResult]) -> dict:
         "no_data": no_data,
         "provider_failures": provider_failures,
         "unknown_errors": unknown_errors,
+        "per_provider": per_provider,
     }
 
 

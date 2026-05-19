@@ -42,9 +42,10 @@ COLUMN_CATALOG = [
     ("remaining",        "Остава",             "Плащане",    False),
 
     ("quality_score",     "Quality score",      "Диагностика", True),
+    ("quality_breakdown", "Quality breakdown",  "Диагностика", False),
     ("validation_errors", "Validation errors",  "Диагностика", True),
     ("registry_status",   "Registry status",    "Диагностика", True),
-    ("is_derived",        "Има производни",     "Диагностика", True),
+    ("derived_fields",    "Производни полета",  "Диагностика", True),
 ]
 
 
@@ -57,6 +58,12 @@ def get_row_value(field, doc, *, validation_findings=None, registry_findings=Non
     """
     if field == "quality_score":
         return round(doc.quality_score, 2) if doc is not None else ""
+    if field == "quality_breakdown":
+        if doc is None or doc.invoice is None:
+            return ""
+        from docflow.quality import format_quality_breakdown, invoice_quality_breakdown
+        _, breakdown = invoice_quality_breakdown(doc.invoice, validation_findings)
+        return format_quality_breakdown(breakdown)
     if field == "validation_errors":
         if not validation_findings:
             return ""
@@ -71,10 +78,10 @@ def get_row_value(field, doc, *, validation_findings=None, registry_findings=Non
         if any(c.startswith("supplier_") for c in codes):
             return "записан"
         return "—"
-    if field == "is_derived":
+    if field == "derived_fields":
         if doc is None or doc.invoice is None:
             return ""
-        return "да" if doc.invoice.derived_fields else "не"
+        return ", ".join(doc.invoice.derived_fields)
 
     if doc is None or doc.invoice is None:
         return ""
