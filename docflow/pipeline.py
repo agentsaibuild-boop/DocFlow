@@ -1,13 +1,10 @@
 from pathlib import Path
 
 from docflow.extractors import Extractor
-from docflow.extractors.azure_extractor import AzureExtractor
-from docflow.extractors.claude_extractor import ClaudeExtractor
 from docflow.extractors.gemini_extractor import GeminiExtractor
 from docflow.extractors.mistral_extractor import MistralExtractor
 from docflow.extractors.openrouter_extractor import OpenRouterExtractor
-from docflow.extractors.pdfplumber_extractor import PdfplumberExtractor
-from docflow.quality import invoice_quality_score
+from docflow.quality import invoice_quality_coverage, invoice_quality_score
 from docflow.schema import ExtractedDocument, is_useful_invoice
 from docflow.text_llm import TextLLMExtractor
 from docflow.text_parser import parse_text_to_invoice
@@ -18,31 +15,24 @@ QUALITY_OK_THRESHOLD = 0.7
 _text_llm = TextLLMExtractor()
 
 EXTRACTORS: list[Extractor] = [
-    PdfplumberExtractor(),  # 1st: born-digital PDF (free, exact text → text_llm)
-    AzureExtractor(),       # 2nd: invoice-specialized model, per-field confidence
-    MistralExtractor(),     # 3rd: Mistral OCR markdown → text_llm
-    ClaudeExtractor(),      # 4th: Claude vision
-    GeminiExtractor(),      # 5th: Gemini default (model from GEMINI_MODEL env)
     GeminiExtractor(model="gemini-3.1-flash-lite", name="gemini_3.1_flash_lite"),
-    GeminiExtractor(model="gemini-2.5-pro", name="gemini_2.5_pro"),
     OpenRouterExtractor(
         model="qwen/qwen3-vl-235b-a22b-instruct",
         name="qwen_3_vl_235b",
-    ),  # best Cyrillic OCR in 10-file benchmark (score 0.99, ~25s latency)
+    ),
+    MistralExtractor(),
 ]
 
 PROVIDER_ALIASES = {
-    "azure": "azure_di_invoice",
-    "pdfplumber": "pdfplumber",
-    "mistral": "mistral_ocr",
-    "claude": "claude",
-    "gemini": "gemini",
     "gemini-3.1-flash-lite": "gemini_3.1_flash_lite",
-    "gemini-2.5-pro": "gemini_2.5_pro",
-    "qwen-3-vl-235b": "qwen_3_vl_235b",
+    "qwen-3-vl-235b":        "qwen_3_vl_235b",
+    "mistral":               "mistral_ocr",
 }
 
-AVAILABLE_PROVIDERS = ["auto"] + list(PROVIDER_ALIASES.keys())
+# UI/CLI-visible provider list. 'auto' is intentionally NOT exposed — every
+# extraction goes through an explicit, named provider so the resulting row's
+# `extraction_method` is unambiguous.
+AVAILABLE_PROVIDERS = list(PROVIDER_ALIASES.keys())
 
 
 def list_providers() -> list[tuple[str, bool, str]]:
@@ -207,6 +197,7 @@ def extract(
                 _derive_missing_totals(doc.invoice)
 
             doc.quality_score = invoice_quality_score(doc.invoice)
+            doc.quality_coverage = invoice_quality_coverage(doc.invoice)
             if doc.quality_score >= QUALITY_OK_THRESHOLD:
                 return doc
             if doc.quality_score > best_score:

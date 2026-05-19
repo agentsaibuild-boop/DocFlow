@@ -16,12 +16,15 @@ load_env_file(Path(__file__).parent / ".env")
 
 from docflow.batch import BatchResult, summarize_batch
 from docflow.columns import COLUMN_CATALOG, get_row_value
+from docflow.eval.benchmarks import BENCHMARKS, get_benchmark
 from docflow.pipeline import AVAILABLE_PROVIDERS, ProviderError, extract, list_providers
+from docflow.provider_catalog import (
+    PROFILES, RECOMMENDED_PROVIDER, get_profile, measured_summary,
+    options_in_display_order,
+)
 from docflow.registry import SupplierRegistry
 from docflow.status import compute_status
 from docflow.validators import validate
-
-DEFAULT_PROVIDER = "gemini-3.1-flash-lite"
 
 st.set_page_config(page_title="DocFlow", page_icon="📄", layout="wide")
 st.title("📄 DocFlow")
@@ -33,49 +36,85 @@ with st.sidebar:
 
     providers_status = list_providers()
     available_only = [alias for alias, ok, _ in providers_status if ok]
-    available_only = ["auto"] + available_only
-    default_idx = available_only.index(DEFAULT_PROVIDER) if DEFAULT_PROVIDER in available_only else 0
+    ordered = options_in_display_order(available_only)
 
+    def _format(provider_id: str) -> str:
+        prof = get_profile(provider_id)
+        if not prof:
+            return provider_id
+        return f"{prof.badge}  {prof.display}"
+
+    default_idx = (
+        ordered.index(RECOMMENDED_PROVIDER) if RECOMMENDED_PROVIDER in ordered else 0
+    )
     provider = st.selectbox(
-        "Модел за извличане",
-        options=available_only,
+        "Модел",
+        options=ordered,
         index=default_idx,
-        help="Кой API ще се ползва. 'auto' пробва всички по реда им.",
+        format_func=_format,
+        help="Избор на AI модел за извличане на данни от фактурата.",
     )
 
-    if provider != "auto":
-        allow_fallback = st.checkbox(
-            "Fallback при квота/503 от избрания provider",
-            value=False,
-            help=(
-                "По подразбиране explicit избор означава „използвай само този”. "
-                "Включи това, ако предпочиташ да получиш резултат от друг "
-                "provider, вместо файлът да се маркира като provider грешка."
-            ),
-        )
+    _prof = get_profile(provider)
+    if _prof is not None:
+        st.caption(_prof.headline)
+        st.caption(_prof.description)
+        if _prof.best_for:
+            st.caption("**Подходящо за:** " + " · ".join(_prof.best_for))
+        st.caption(f"ℹ️ {_prof.tradeoff}")
+        st.caption(f"💰 {_prof.cost}")
+        _summary = measured_summary(provider)
+        if _summary:
+            st.caption(f"📐 {_summary}")
     else:
-        allow_fallback = None  # auto → пълна верига по подразбиране
+        st.caption(f"Текущ модел: `{provider}`")
+
+    allow_fallback = st.checkbox(
+        "Опитай друг модел, ако избраният не отговаря",
+        value=False,
+        help=(
+            "По подразбиране се ползва само избраният модел. Ако той не "
+            "отговаря (претоварен, временно недостъпен), файлът се маркира "
+            "като грешка. С тази отметка системата ще опита следващите модели."
+        ),
+    )
+
+    with st.expander("⚙️ Advanced"):
+        st.caption(f"Технически идентификатор: `{provider}`")
+        st.caption("Достъпни модели: " + ", ".join(f"`{p}`" for p in ordered))
 
     st.divider()
     st.subheader("📋 Колони за експорт")
-    categories: dict[str, list] = {}
-    for key, label, cat, _ in COLUMN_CATALOG:
-        categories.setdefault(cat, []).append((key, label))
 
-    label_to_key = {label: key for key, label, _, _ in COLUMN_CATALOG}
-    selected_columns = []
+    # Flat checkbox UX. Default-on business columns sit at the top, visible
+    # without clicks. Optional and diagnostic columns live behind one expander
+    # each. No nested multiselects, no chip-pills, no hidden state.
+    _visible_keys     = [k for k, _, cat, default in COLUMN_CATALOG
+                         if default and cat != "Диагностика"]
+    _diagnostic_keys  = [k for k, _, cat, _ in COLUMN_CATALOG if cat == "Диагностика"]
+    _optional_keys    = [k for k, _, cat, default in COLUMN_CATALOG
+                         if (not default) and cat != "Диагностика"]
+    _label_by_key     = {k: lbl for k, lbl, _, _ in COLUMN_CATALOG}
+    _default_by_key   = {k: d for k, _, _, d in COLUMN_CATALOG}
 
-    for cat, items in categories.items():
-        category_defaults = [label for key, label, c, d in COLUMN_CATALOG if c == cat and d]
-        category_labels = [label for _, label in items]
-        picked = st.multiselect(
-            cat,
-            options=category_labels,
-            default=category_defaults,
-            key=f"ms_{cat}",
-        )
-        for label in picked:
-            selected_columns.append(label_to_key[label])
+    selected_columns: list[str] = []
+
+    def _column_checkbox(key: str) -> None:
+        # Single source of truth: the catalog default seeds the initial state,
+        # afterwards st.checkbox owns it via its widget key.
+        if st.checkbox(_label_by_key[key], value=_default_by_key[key], key=f"col_{key}"):
+            selected_columns.append(key)
+
+    for k in _visible_keys:
+        _column_checkbox(k)
+
+    with st.expander("Допълнителни колони"):
+        for k in _optional_keys:
+            _column_checkbox(k)
+
+    with st.expander("Диагностика"):
+        for k in _diagnostic_keys:
+            _column_checkbox(k)
 
     st.session_state["selected_columns"] = selected_columns
     st.caption(f"✓ Активни колони: **{len(selected_columns)}**")
@@ -89,7 +128,9 @@ with st.sidebar:
             st.caption(f"   {note}")
 
 
-tab_upload, tab_results, tab_registry = st.tabs(["📤 Качване", "📊 Резултати", "🏢 Регистър"])
+tab_upload, tab_results, tab_registry, tab_modes = st.tabs(
+    ["📤 Качване", "📊 Резултати", "🏢 Регистър", "🤖 Модели"]
+)
 
 
 MAX_PARALLEL = 5
@@ -427,3 +468,44 @@ with tab_registry:
             if col in df.columns:
                 df = df.drop(columns=[col])
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+with tab_modes:
+    st.subheader("🤖 Модели за извличане")
+    st.caption(
+        "Подкрепени AI модели. Изборът е твой — описанието под всеки казва "
+        "за какъв вид фактури е силен и какво носят със себе си."
+    )
+
+    for prof in PROFILES:
+        if prof.provider not in AVAILABLE_PROVIDERS:
+            continue
+        with st.container(border=True):
+            st.markdown(f"### {prof.badge}  {prof.display}")
+            st.markdown(f"_{prof.headline}_")
+            st.markdown(prof.description)
+            if prof.best_for:
+                st.markdown("**Подходящо за:** " + " · ".join(prof.best_for))
+            st.markdown(f"ℹ️ {prof.tradeoff}")
+            st.markdown(f"💰 {prof.cost}")
+            _sum = measured_summary(prof.provider)
+            if _sum:
+                st.markdown(f"📐 {_sum}")
+
+    with st.expander("Сравнителна таблица (за напреднали)"):
+        import pandas as pd
+        rows = []
+        for prof in PROFILES:
+            if prof.provider not in AVAILABLE_PROVIDERS:
+                continue
+            rows.append({
+                "Модел":          prof.display,
+                "Etикет":         prof.badge,
+                "За какво е":     prof.headline,
+                "Подходящо за":   " · ".join(prof.best_for),
+                "Какво да знаеш": prof.tradeoff,
+                "Цена":           prof.cost,
+                "От нашия тест":  measured_summary(prof.provider) or "Все още нямаме достатъчно реални тестове.",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
