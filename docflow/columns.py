@@ -41,11 +41,14 @@ COLUMN_CATALOG = [
     ("paid",             "Платени",            "Плащане",    False),
     ("remaining",        "Остава",             "Плащане",    False),
 
-    ("quality_score",     "Quality score",      "Диагностика", True),
+    # Diagnostic columns: internal telemetry, NOT part of the standard
+    # business export. All default to False and the UI hides them behind a
+    # "Диагностичен режим" toggle. Useful for audits and pipeline debugging.
+    ("quality_score",     "Quality score",      "Диагностика", False),
     ("quality_breakdown", "Quality breakdown",  "Диагностика", False),
-    ("validation_errors", "Validation errors",  "Диагностика", True),
-    ("registry_status",   "Registry status",    "Диагностика", True),
-    ("derived_fields",    "Производни полета",  "Диагностика", True),
+    ("validation_errors", "Validation errors",  "Диагностика", False),
+    ("registry_status",   "Registry status",    "Диагностика", False),
+    ("derived_fields",    "Производни полета",  "Диагностика", False),
 ]
 
 

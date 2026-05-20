@@ -69,26 +69,21 @@ with st.sidebar:
     else:
         st.caption(f"Текущ модел: `{provider}`")
 
-    allow_fallback = st.checkbox(
-        "Опитай друг модел, ако избраният не отговаря",
-        value=False,
-        help=(
-            "По подразбиране се ползва само избраният модел. Ако той не "
-            "отговаря (претоварен, временно недостъпен), файлът се маркира "
-            "като грешка. С тази отметка системата ще опита следващите модели."
-        ),
-    )
-
-    with st.expander("⚙️ Advanced"):
-        st.caption(f"Технически идентификатор: `{provider}`")
-        st.caption("Достъпни модели: " + ", ".join(f"`{p}`" for p in ordered))
+    # Fallback orchestration is kept internal. The capability exists in the
+    # pipeline, but exposing it as a UI toggle implied user control over
+    # provider routing that we don't yet document well enough (which model
+    # takes over, latency change, cost impact). Default behavior: stay on
+    # the chosen model; failure is surfaced as a provider error.
+    allow_fallback = False
 
     st.divider()
     st.subheader("📋 Колони за експорт")
 
-    # Flat checkbox UX. Default-on business columns sit at the top, visible
-    # without clicks. Optional and diagnostic columns live behind one expander
-    # each. No nested multiselects, no chip-pills, no hidden state.
+    # Flat checkbox UX. Default-on business columns visible at the top,
+    # optional business columns behind one expander. Diagnostic columns
+    # (quality score, validation errors, registry status, derived fields)
+    # are internal telemetry and never appear in the standard flow — they
+    # surface only when "Диагностичен режим" is explicitly enabled.
     _visible_keys     = [k for k, _, cat, default in COLUMN_CATALOG
                          if default and cat != "Диагностика"]
     _diagnostic_keys  = [k for k, _, cat, _ in COLUMN_CATALOG if cat == "Диагностика"]
@@ -100,8 +95,6 @@ with st.sidebar:
     selected_columns: list[str] = []
 
     def _column_checkbox(key: str) -> None:
-        # Single source of truth: the catalog default seeds the initial state,
-        # afterwards st.checkbox owns it via its widget key.
         if st.checkbox(_label_by_key[key], value=_default_by_key[key], key=f"col_{key}"):
             selected_columns.append(key)
 
@@ -112,12 +105,24 @@ with st.sidebar:
         for k in _optional_keys:
             _column_checkbox(k)
 
-    with st.expander("Диагностика"):
+    st.caption(f"✓ Активни колони: **{len(selected_columns)}**")
+
+    diagnostic_mode = st.toggle(
+        "🔧 Диагностичен режим",
+        value=False,
+        help=(
+            "Добавя технически колони към експорта — quality score, validation "
+            "errors, registry status, производни полета. Полезно за одит и "
+            "проверка как е работила системата на конкретна фактура."
+        ),
+    )
+    if diagnostic_mode:
+        st.caption(
+            "_Диагностичните колони са вътрешни — не са част от стандартния "
+            "счетоводен експорт. Включват се само за одит / debug._"
+        )
         for k in _diagnostic_keys:
             _column_checkbox(k)
-
-    st.session_state["selected_columns"] = selected_columns
-    st.caption(f"✓ Активни колони: **{len(selected_columns)}**")
 
     st.divider()
     st.subheader("Статус на provider-и")
@@ -128,8 +133,8 @@ with st.sidebar:
             st.caption(f"   {note}")
 
 
-tab_upload, tab_results, tab_registry, tab_modes = st.tabs(
-    ["📤 Качване", "📊 Резултати", "🏢 Регистър", "🤖 Модели"]
+tab_upload, tab_results, tab_modes = st.tabs(
+    ["📤 Качване", "📊 Резултати", "🤖 Модели"]
 )
 
 
@@ -391,51 +396,6 @@ with tab_results:
         st.subheader(f"Преглед — {len(selected)} избрани колони")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        st.divider()
-        st.subheader("💾 Запис в регистър на доставчик")
-        st.caption(
-            "Регистърът се записва **само** след ръчно потвърждение. "
-            "Това предотвратява автоматично закотвяне на грешно извлечени данни."
-        )
-
-        recordable: list[tuple[int, BatchResult]] = []
-        for idx, r in enumerate(results):
-            if r.error or not r.doc or not r.doc.invoice:
-                continue
-            inv = r.doc.invoice
-            if not inv.supplier or not inv.supplier.name:
-                continue
-            if not (inv.supplier.eik or inv.supplier.vat_number):
-                continue
-            recordable.append((idx, r))
-
-        if not recordable:
-            st.info("Няма фактури с достатъчно данни за запис (нужни са име на доставчик + ЕИК или ИН по ДДС).")
-        else:
-            options = {
-                f"{r.source.name} — {r.doc.invoice.supplier.name}": (idx, r)
-                for idx, r in recordable
-            }
-            choice = st.selectbox(
-                "Избери фактура за запис на доставчика",
-                options=list(options.keys()),
-            )
-            if choice and st.button(
-                "Потвърждавам данните и записвам доставчика",
-                type="primary",
-                key="confirm_record",
-            ):
-                _, chosen = options[choice]
-                registry = SupplierRegistry()
-                findings = registry.record(chosen.doc.invoice, human_confirmed=True)
-                for f in findings:
-                    if f.level == "ok":
-                        st.success(f.message)
-                    elif f.level == "warning":
-                        st.warning(f.message)
-                    else:
-                        st.info(f.message)
-
         with st.expander("🔍 Validation проблеми (детайли)"):
             issues_rows = []
             for r in results:
@@ -451,23 +411,6 @@ with tab_results:
                 st.dataframe(pd.DataFrame(issues_rows), use_container_width=True, hide_index=True)
             else:
                 st.success("Няма validation проблеми ✓")
-
-
-with tab_registry:
-    st.subheader("Регистър на познатите доставчици")
-    st.caption("Системата запомня доставчиците от обработените фактури и автоматично "
-               "коригира известни полета при следващи фактури от същия доставчик.")
-    registry = SupplierRegistry()
-    suppliers = registry.all()
-    if not suppliers:
-        st.info("Регистърът е празен. Обработи няколко фактури за да се запълни.")
-    else:
-        import pandas as pd
-        df = pd.DataFrame(suppliers)
-        for col in ["aliases", "first_seen"]:
-            if col in df.columns:
-                df = df.drop(columns=[col])
-        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 with tab_modes:
