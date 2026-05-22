@@ -169,8 +169,8 @@ def _is_over_batch_limit(file_count: int) -> bool:
 
 def _over_batch_limit_message(file_count: int) -> str:
     return (
-        f"Максимумът за едно качване е {MAX_FILES_PER_BATCH} файла. "
-        "Премахнете част от файловете и опитайте отново."
+        f"Публичната демо версия приема максимум {MAX_FILES_PER_BATCH} "
+        f"файла наведнъж. Моля, качи до {MAX_FILES_PER_BATCH} файла."
     )
 
 
@@ -280,8 +280,9 @@ with tab_upload:
             label_visibility="collapsed",
         )
         st.caption(
-            f"До {MAX_FILES_PER_BATCH} файла наведнъж · до {MAX_FILE_SIZE_MB} MB на файл · "
-            "PDF, JPG, PNG, WEBP, TIF, BMP"
+            f"Публичната демо версия приема до {MAX_FILES_PER_BATCH} файла наведнъж · "
+            f"до {MAX_FILE_SIZE_MB} MB на файл. В реална/инсталирана версия "
+            "лимитът може да бъде настроен според нуждите."
         )
         if uploaded_files:
             if _is_over_batch_limit(len(uploaded_files)):

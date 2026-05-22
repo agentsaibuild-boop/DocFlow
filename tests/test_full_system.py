@@ -1349,20 +1349,18 @@ def test_upload_over_limit_blocks_and_does_not_truncate():
     # Over the limit → block.
     assert _app._is_over_batch_limit(26) is True
 
-    # Upload-mode message: states the limit and instructs the user to remove
-    # files. Confident copy — no "демо" framing.
+    # Upload-mode message names the public-demo framing and the limit.
     msg = _app._over_batch_limit_message(30).lower()
+    assert "публичната демо" in msg
     assert "максимум" in msg
     assert "25" in msg
-    assert "премахнете" in msg
-    assert "демо" not in msg  # no infrastructure-anxiety wording
+    assert "качи" in msg
 
     # Folder variant references "папка" AND includes the actual count so the
     # user knows the source of the overflow.
     fmsg = _app._folder_over_limit_message(42)
     assert "42" in fmsg and "25" in fmsg
     assert "папка" in fmsg.lower()
-    assert "демо" not in fmsg.lower()
 
 
 def test_upload_flow_has_no_silent_truncation():
