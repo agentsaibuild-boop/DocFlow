@@ -24,11 +24,7 @@ def _hydrate_env_from_streamlit_secrets() -> None:
         secrets = dict(_st.secrets)
     except Exception:
         return
-    for key in (
-        "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_RETRY_DELAYS",
-        "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
-        "MISTRAL_API_KEY",
-    ):
+    for key in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
         if key not in os.environ and key in secrets:
             os.environ[key] = str(secrets[key])
 
@@ -190,13 +186,13 @@ def _process_single(name, get_bytes, get_path, provider, allow_fallback):
         doc.source_path = name
         return ("ok", name, doc, None, None, None)
     except ProviderError as pe:
-        # Don't leak the raw exception body — provider errors can echo back
-        # the HTTP body, which sometimes includes the auth header. Keep only
-        # the kind; status.py turns kind into a friendly Bulgarian sentence.
-        return ("provider", name, None, None, pe.kind, f"[{pe.provider}/{pe.kind}]")
+        # Pass through with the tmp path masked; status.py decides what reaches
+        # the UI based on the kind. One UI-safe layer (status.py), not two.
+        msg = str(pe).replace(str(tmp_path), name)
+        return ("provider", name, None, None, pe.kind, msg)
     except Exception as e:
-        # Sanitised: only the exception class name reaches the UI.
-        return ("err", name, None, type(e).__name__, None, None)
+        msg = str(e).replace(str(tmp_path), name)
+        return ("err", name, None, f"{type(e).__name__}: {msg}", None, None)
     finally:
         if cleanup:
             tmp_path.unlink(missing_ok=True)
@@ -274,14 +270,7 @@ with tab_upload:
                 lambda p=SAMPLE_DEMO_INVOICE: p.read_bytes(),
                 lambda: None,
             )]
-            st.success(
-                f"📄 Готова за обработка демо фактура: **{SAMPLE_DEMO_INVOICE.name}**. "
-                "Натисни „🚀 Обработи” по-долу."
-            )
-            st.caption(
-                "_Този файл е реална българска фактура от EuroFaktura template. "
-                "Резултатът се връща за около 5-8 секунди._"
-            )
+            st.success("📄 Заредена е примерна фактура. Натисни Обработи.")
         else:
             st.error(
                 f"⚠️ Демо файлът липсва ({SAMPLE_DEMO_INVOICE.name}). "
