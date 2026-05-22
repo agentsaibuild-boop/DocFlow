@@ -1,9 +1,5 @@
 [server]
-# 10 MB per uploaded file. Anything bigger is rejected by the file_uploader
-# itself with a built-in error — keeps the public demo from melting on huge
-# scans uploaded by accident.
-maxUploadSize = 10
+maxUploadSize = 25
 
-# Disable the small "Made with Streamlit" footer to keep the page clean.
 [client]
 toolbarMode = "minimal"

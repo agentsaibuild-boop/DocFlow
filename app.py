@@ -157,12 +157,29 @@ tab_upload, tab_results, tab_modes = st.tabs(
 
 MAX_PARALLEL = 5
 
-# Abuse-protection guardrails for the public demo. Keep in sync with the
-# user-visible warning text in tab_upload. .streamlit/config.toml caps each
-# upload at MAX_FILE_SIZE_MB at the Streamlit layer; the batch-count cap is
-# enforced here because Streamlit doesn't have a built-in equivalent.
 MAX_FILES_PER_BATCH = 5
-MAX_FILE_SIZE_MB    = 10
+MAX_FILE_SIZE_MB    = 25
+
+
+def _is_over_batch_limit(file_count: int) -> bool:
+    """True when the batch exceeds MAX_FILES_PER_BATCH. Processing must block;
+    we do not silently truncate."""
+    return file_count > MAX_FILES_PER_BATCH
+
+
+def _over_batch_limit_message(file_count: int) -> str:
+    return (
+        f"Максимумът за едно качване е {MAX_FILES_PER_BATCH} файла. "
+        "Премахнете част от файловете и опитайте отново."
+    )
+
+
+def _folder_over_limit_message(file_count: int) -> str:
+    return (
+        f"Папката съдържа {file_count} файла. "
+        f"Максимумът за едно качване е {MAX_FILES_PER_BATCH}. "
+        "Намалете съдържанието на папката или използвайте CLI batch режима."
+    )
 
 
 def _process_single(name, get_bytes, get_path, provider, allow_fallback):
@@ -247,9 +264,7 @@ def process_files(file_sources, registry, provider, allow_fallback):
 
 with tab_upload:
     st.caption(
-        f"💡 Демото приема **до {MAX_FILES_PER_BATCH} файла наведнъж**, "
-        f"всеки до **{MAX_FILE_SIZE_MB} MB**. Това пази от случайно "
-        f"претоварване на услугите."
+        f"Можете да качите до {MAX_FILES_PER_BATCH} файла наведнъж, всеки до {MAX_FILE_SIZE_MB} MB."
     )
 
     mode = st.radio(
@@ -269,18 +284,16 @@ with tab_upload:
             label_visibility="collapsed",
         )
         if uploaded_files:
-            if len(uploaded_files) > MAX_FILES_PER_BATCH:
-                st.warning(
-                    f"⚠️ Качи си {len(uploaded_files)} файла, но демото "
-                    f"приема до **{MAX_FILES_PER_BATCH} наведнъж**. "
-                    f"Ще се обработят само първите {MAX_FILES_PER_BATCH}."
-                )
-                uploaded_files = uploaded_files[:MAX_FILES_PER_BATCH]
-            file_sources = [
-                (u.name, (lambda u=u: u.getvalue()), (lambda: None))
-                for u in uploaded_files
-            ]
-            st.info(f"📎 {len(uploaded_files)} файла готови. Модел: **{provider}**")
+            if _is_over_batch_limit(len(uploaded_files)):
+                # Hard block — do NOT populate file_sources. The "🚀 Обработи"
+                # button stays disabled (it tests `not file_sources`).
+                st.error(_over_batch_limit_message(len(uploaded_files)))
+            else:
+                file_sources = [
+                    (u.name, (lambda u=u: u.getvalue()), (lambda: None))
+                    for u in uploaded_files
+                ]
+                st.info(f"📎 {len(uploaded_files)} файла готови. Модел: **{provider}**")
     else:
         from docflow.batch import discover
         default_path = str(Path.home() / "Desktop")
@@ -326,14 +339,10 @@ with tab_upload:
                 files = discover(path)
                 if not files:
                     st.warning(f"⚠️ Няма поддържани файлове в {path}")
+                elif _is_over_batch_limit(len(files)):
+                    # Hard block — same policy as the upload mode.
+                    st.error(_folder_over_limit_message(len(files)))
                 else:
-                    if len(files) > MAX_FILES_PER_BATCH:
-                        st.warning(
-                            f"⚠️ Намерени са {len(files)} файла, но демото обработва "
-                            f"до **{MAX_FILES_PER_BATCH}** наведнъж. Ще се вземат "
-                            f"само първите {MAX_FILES_PER_BATCH}."
-                        )
-                        files = files[:MAX_FILES_PER_BATCH]
                     st.success(f"📂 Готови за обработка **{len(files)}** файла в `{path.name}/`. Модел: **{provider}**")
                     file_sources = [
                         (f.name, (lambda: b""), (lambda f=f: f))

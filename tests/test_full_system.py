@@ -1335,6 +1335,48 @@ def test_eval_regression_diff_surfaces_deltas():
     return "deltas surface in diff"
 
 
+def test_upload_over_limit_blocks_and_does_not_truncate():
+    """Batch-size guard must hard-block, not silently truncate. The helpers
+    exposed by app.py are the same ones the UI uses."""
+    import app as _app
+    assert _app.MAX_FILES_PER_BATCH == 5, _app.MAX_FILES_PER_BATCH
+
+    # Inside the limit → no block.
+    assert _app._is_over_batch_limit(0) is False
+    assert _app._is_over_batch_limit(1) is False
+    assert _app._is_over_batch_limit(5) is False
+
+    # Over the limit → block.
+    assert _app._is_over_batch_limit(6) is True
+
+    # Upload-mode message: states the limit and instructs the user to remove
+    # files. Confident copy — no "демо" framing.
+    msg = _app._over_batch_limit_message(17).lower()
+    assert "максимум" in msg
+    assert "5" in msg
+    assert "премахнете" in msg
+    assert "демо" not in msg  # no infrastructure-anxiety wording
+
+    # Folder variant references "папка" AND includes the actual count so the
+    # user knows the source of the overflow.
+    fmsg = _app._folder_over_limit_message(42)
+    assert "42" in fmsg and "5" in fmsg
+    assert "папка" in fmsg.lower()
+    assert "демо" not in fmsg.lower()
+
+
+def test_upload_flow_has_no_silent_truncation():
+    """Defence against regression: source must not contain a slice that
+    silently trims to MAX_FILES_PER_BATCH."""
+    src = Path("app.py").read_text(encoding="utf-8")
+    forbidden = (
+        "uploaded_files[:MAX_FILES_PER_BATCH]",
+        "files[:MAX_FILES_PER_BATCH]",
+    )
+    for needle in forbidden:
+        assert needle not in src, f"silent truncation found: {needle}"
+
+
 def test_reject_criteria_end_to_end_xlsx():
     """End-to-end acceptance: build the three reject-criteria scenarios as real
     InvoiceData, run them through write_consolidated → reload xlsx → assert
@@ -1778,6 +1820,8 @@ TESTS: list[tuple[str, Callable]] = [
     ("eval: aggregate computes critical-field and wrong-but-confident rates", test_eval_aggregate_metrics_critical_and_wbc),
     ("eval: write_all produces json + md + csv + xlsx", test_eval_report_writes_all_four_files),
     ("eval: regression diff surfaces top-line + per-file deltas", test_eval_regression_diff_surfaces_deltas),
+    ("upload: over-limit blocks (no silent truncation)", test_upload_over_limit_blocks_and_does_not_truncate),
+    ("upload: app.py contains no silent-truncation slice", test_upload_flow_has_no_silent_truncation),
     ("acceptance: 3 reject-criteria scenarios through real xlsx export", test_reject_criteria_end_to_end_xlsx),
     ("status: diagnostic columns never gate status", test_diagnostic_keys_never_gate_status),
     ("currency: schema default is None", test_currency_default_is_none),
