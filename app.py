@@ -164,8 +164,6 @@ MAX_PARALLEL = 5
 MAX_FILES_PER_BATCH = 5
 MAX_FILE_SIZE_MB    = 10
 
-SAMPLE_DEMO_INVOICE = Path(__file__).parent / "samples" / "eurofaktura_sample.jpg"
-
 
 def _process_single(name, get_bytes, get_path, provider, allow_fallback):
     """Worker: runs in thread, no Streamlit calls.
@@ -256,28 +254,14 @@ with tab_upload:
 
     mode = st.radio(
         "Източник на фактурите",
-        ["📄 Опитай с примерна фактура", "📤 Качи файлове", "📁 Папка от път"],
+        ["📤 Качи файлове", "📁 Папка от път"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
     file_sources = []
 
-    if mode == "📄 Опитай с примерна фактура":
-        if SAMPLE_DEMO_INVOICE.exists():
-            file_sources = [(
-                SAMPLE_DEMO_INVOICE.name,
-                lambda p=SAMPLE_DEMO_INVOICE: p.read_bytes(),
-                lambda: None,
-            )]
-            st.success("📄 Заредена е примерна фактура. Натисни Обработи.")
-        else:
-            st.error(
-                f"⚠️ Демо файлът липсва ({SAMPLE_DEMO_INVOICE.name}). "
-                "Качи своя фактура от другия раздел."
-            )
-
-    elif mode == "📤 Качи файлове":
+    if mode == "📤 Качи файлове":
         uploaded_files = st.file_uploader(
             "PDF, JPG, PNG (избери един или много)",
             accept_multiple_files=True,
