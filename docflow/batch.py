@@ -5,7 +5,6 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
-from docflow.output import write_excel
 from docflow.pipeline import NoExtractorFound, ProviderError, extract
 from docflow.registry import SupplierRegistry
 from docflow.schema import ExtractedDocument
