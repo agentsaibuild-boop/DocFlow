@@ -197,10 +197,13 @@ def compute_status(
         )
 
     if extraction_error:
+        # extraction_error already arrives sanitised to an exception class name
+        # (see app._process_single). We don't surface that to the user — only
+        # the calm sentence below.
         return StatusResult(
             code="ERROR",
-            label="❌ ERROR",
-            notes=f"Извличането се провали: {extraction_error[:120]}",
+            label="❌ Грешка",
+            notes="Файлът не беше обработен. Опитай отново или избери друг режим.",
         )
 
     inv = doc.invoice if doc is not None else None

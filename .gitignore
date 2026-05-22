@@ -18,6 +18,9 @@ output/*
 !output/.gitkeep
 samples/*
 !samples/.gitkeep
+# Demo invoice for the "Опитай с примерна фактура" flow. Ships with the
+# public deployment so evaluators have a guaranteed-success happy path.
+!samples/eurofaktura_sample.jpg
 
 .vscode/
 .idea/

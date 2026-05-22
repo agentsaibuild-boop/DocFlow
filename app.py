@@ -161,6 +161,15 @@ tab_upload, tab_results, tab_modes = st.tabs(
 
 MAX_PARALLEL = 5
 
+# Abuse-protection guardrails for the public demo. Keep in sync with the
+# user-visible warning text in tab_upload. .streamlit/config.toml caps each
+# upload at MAX_FILE_SIZE_MB at the Streamlit layer; the batch-count cap is
+# enforced here because Streamlit doesn't have a built-in equivalent.
+MAX_FILES_PER_BATCH = 5
+MAX_FILE_SIZE_MB    = 10
+
+SAMPLE_DEMO_INVOICE = Path(__file__).parent / "samples" / "eurofaktura_sample.jpg"
+
 
 def _process_single(name, get_bytes, get_path, provider, allow_fallback):
     """Worker: runs in thread, no Streamlit calls.
@@ -181,11 +190,13 @@ def _process_single(name, get_bytes, get_path, provider, allow_fallback):
         doc.source_path = name
         return ("ok", name, doc, None, None, None)
     except ProviderError as pe:
-        msg = str(pe).replace(str(tmp_path), name)
-        return ("provider", name, None, None, pe.kind, msg)
+        # Don't leak the raw exception body — provider errors can echo back
+        # the HTTP body, which sometimes includes the auth header. Keep only
+        # the kind; status.py turns kind into a friendly Bulgarian sentence.
+        return ("provider", name, None, None, pe.kind, f"[{pe.provider}/{pe.kind}]")
     except Exception as e:
-        msg = str(e).replace(str(tmp_path), name)
-        return ("err", name, None, f"{type(e).__name__}: {msg}", None, None)
+        # Sanitised: only the exception class name reaches the UI.
+        return ("err", name, None, type(e).__name__, None, None)
     finally:
         if cleanup:
             tmp_path.unlink(missing_ok=True)
@@ -241,16 +252,43 @@ def process_files(file_sources, registry, provider, allow_fallback):
 
 
 with tab_upload:
+    st.caption(
+        f"💡 Демото приема **до {MAX_FILES_PER_BATCH} файла наведнъж**, "
+        f"всеки до **{MAX_FILE_SIZE_MB} MB**. Това пази от случайно "
+        f"претоварване на услугите."
+    )
+
     mode = st.radio(
         "Източник на фактурите",
-        ["📤 Качи файлове", "📁 Папка от път (за големи batch-ове)"],
+        ["📄 Опитай с примерна фактура", "📤 Качи файлове", "📁 Папка от път"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
     file_sources = []
 
-    if mode == "📤 Качи файлове":
+    if mode == "📄 Опитай с примерна фактура":
+        if SAMPLE_DEMO_INVOICE.exists():
+            file_sources = [(
+                SAMPLE_DEMO_INVOICE.name,
+                lambda p=SAMPLE_DEMO_INVOICE: p.read_bytes(),
+                lambda: None,
+            )]
+            st.success(
+                f"📄 Готова за обработка демо фактура: **{SAMPLE_DEMO_INVOICE.name}**. "
+                "Натисни „🚀 Обработи” по-долу."
+            )
+            st.caption(
+                "_Този файл е реална българска фактура от EuroFaktura template. "
+                "Резултатът се връща за около 5-8 секунди._"
+            )
+        else:
+            st.error(
+                f"⚠️ Демо файлът липсва ({SAMPLE_DEMO_INVOICE.name}). "
+                "Качи своя фактура от другия раздел."
+            )
+
+    elif mode == "📤 Качи файлове":
         uploaded_files = st.file_uploader(
             "PDF, JPG, PNG (избери един или много)",
             accept_multiple_files=True,
@@ -258,11 +296,18 @@ with tab_upload:
             label_visibility="collapsed",
         )
         if uploaded_files:
+            if len(uploaded_files) > MAX_FILES_PER_BATCH:
+                st.warning(
+                    f"⚠️ Качи си {len(uploaded_files)} файла, но демото "
+                    f"приема до **{MAX_FILES_PER_BATCH} наведнъж**. "
+                    f"Ще се обработят само първите {MAX_FILES_PER_BATCH}."
+                )
+                uploaded_files = uploaded_files[:MAX_FILES_PER_BATCH]
             file_sources = [
                 (u.name, (lambda u=u: u.getvalue()), (lambda: None))
                 for u in uploaded_files
             ]
-            st.info(f"📎 {len(uploaded_files)} файла готови. Provider: **{provider}**")
+            st.info(f"📎 {len(uploaded_files)} файла готови. Модел: **{provider}**")
     else:
         from docflow.batch import discover
         default_path = str(Path.home() / "Desktop")
@@ -309,7 +354,14 @@ with tab_upload:
                 if not files:
                     st.warning(f"⚠️ Няма поддържани файлове в {path}")
                 else:
-                    st.success(f"📂 Намерени **{len(files)}** файла в `{path.name}/`. Provider: **{provider}**")
+                    if len(files) > MAX_FILES_PER_BATCH:
+                        st.warning(
+                            f"⚠️ Намерени са {len(files)} файла, но демото обработва "
+                            f"до **{MAX_FILES_PER_BATCH}** наведнъж. Ще се вземат "
+                            f"само първите {MAX_FILES_PER_BATCH}."
+                        )
+                        files = files[:MAX_FILES_PER_BATCH]
+                    st.success(f"📂 Готови за обработка **{len(files)}** файла в `{path.name}/`. Модел: **{provider}**")
                     file_sources = [
                         (f.name, (lambda: b""), (lambda f=f: f))
                         for f in files
@@ -376,7 +428,7 @@ with tab_results:
                 row["Метод"] = "—"
                 for col in selected:
                     row[label_for[col]] = ""
-                row["Бележки"] = r.error[:80]
+                row["Бележки"] = status.notes
             else:
                 doc = r.doc
                 row["Метод"] = doc.extraction_method.replace("gemini:", "").replace(":claude-sonnet-4-6", "")
