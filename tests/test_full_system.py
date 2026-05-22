@@ -1339,28 +1339,28 @@ def test_upload_over_limit_blocks_and_does_not_truncate():
     """Batch-size guard must hard-block, not silently truncate. The helpers
     exposed by app.py are the same ones the UI uses."""
     import app as _app
-    assert _app.MAX_FILES_PER_BATCH == 5, _app.MAX_FILES_PER_BATCH
+    assert _app.MAX_FILES_PER_BATCH == 25, _app.MAX_FILES_PER_BATCH
 
     # Inside the limit → no block.
     assert _app._is_over_batch_limit(0) is False
     assert _app._is_over_batch_limit(1) is False
-    assert _app._is_over_batch_limit(5) is False
+    assert _app._is_over_batch_limit(25) is False
 
     # Over the limit → block.
-    assert _app._is_over_batch_limit(6) is True
+    assert _app._is_over_batch_limit(26) is True
 
     # Upload-mode message: states the limit and instructs the user to remove
     # files. Confident copy — no "демо" framing.
-    msg = _app._over_batch_limit_message(17).lower()
+    msg = _app._over_batch_limit_message(30).lower()
     assert "максимум" in msg
-    assert "5" in msg
+    assert "25" in msg
     assert "премахнете" in msg
     assert "демо" not in msg  # no infrastructure-anxiety wording
 
     # Folder variant references "папка" AND includes the actual count so the
     # user knows the source of the overflow.
     fmsg = _app._folder_over_limit_message(42)
-    assert "42" in fmsg and "5" in fmsg
+    assert "42" in fmsg and "25" in fmsg
     assert "папка" in fmsg.lower()
     assert "демо" not in fmsg.lower()
 

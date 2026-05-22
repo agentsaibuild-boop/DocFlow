@@ -157,7 +157,7 @@ tab_upload, tab_results, tab_modes = st.tabs(
 
 MAX_PARALLEL = 5
 
-MAX_FILES_PER_BATCH = 5
+MAX_FILES_PER_BATCH = 25
 MAX_FILE_SIZE_MB    = 25
 
 
