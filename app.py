@@ -263,10 +263,6 @@ def process_files(file_sources, registry, provider, allow_fallback):
 
 
 with tab_upload:
-    st.caption(
-        f"Можете да качите до {MAX_FILES_PER_BATCH} файла наведнъж, всеки до {MAX_FILE_SIZE_MB} MB."
-    )
-
     mode = st.radio(
         "Източник на фактурите",
         ["📤 Качи файлове", "📁 Папка от път"],
@@ -282,6 +278,10 @@ with tab_upload:
             accept_multiple_files=True,
             type=["pdf", "jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp"],
             label_visibility="collapsed",
+        )
+        st.caption(
+            f"До {MAX_FILES_PER_BATCH} файла наведнъж · до {MAX_FILE_SIZE_MB} MB на файл · "
+            "PDF, JPG, PNG, WEBP, TIF, BMP"
         )
         if uploaded_files:
             if _is_over_batch_limit(len(uploaded_files)):
