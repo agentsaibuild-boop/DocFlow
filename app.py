@@ -14,6 +14,27 @@ import streamlit as st
 from docflow.env import load_env_file
 load_env_file(Path(__file__).parent / ".env")
 
+# Streamlit Cloud / Streamlit-hosted deployments don't read .env — they pass
+# secrets through st.secrets. Mirror known provider keys into os.environ so
+# the rest of the code (extractors, env helpers) keeps working unchanged
+# without any cloud-specific branching downstream.
+def _hydrate_env_from_streamlit_secrets() -> None:
+    try:
+        import streamlit as _st
+        secrets = dict(_st.secrets)
+    except Exception:
+        return
+    for key in (
+        "GEMINI_API_KEY", "GEMINI_MODEL", "GEMINI_RETRY_DELAYS",
+        "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
+        "MISTRAL_API_KEY",
+    ):
+        if key not in os.environ and key in secrets:
+            os.environ[key] = str(secrets[key])
+
+
+_hydrate_env_from_streamlit_secrets()
+
 from docflow.batch import BatchResult, summarize_batch
 from docflow.columns import COLUMN_CATALOG, get_row_value
 from docflow.eval.benchmarks import BENCHMARKS, get_benchmark

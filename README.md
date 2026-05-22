@@ -1,197 +1,111 @@
 # DocFlow
 
-**Bulgarian Cyrillic invoice & protocol extraction system.** Reads PDF or image, returns structured data (Excel + canonical JSON), validates, and learns per-supplier from corrections.
+Извличане на структурирани данни от **български фактури** в табличен (Excel) вид. Качваш PDF или снимка → DocFlow разпознава полетата → сваляш `.xlsx`.
 
-Status: **v0.1 working prototype.** Single-document extraction proven end-to-end on a real Bulgarian invoice (Gemini 2.5 Flash path) and a born-digital PDF (pdfplumber path). Batch processing produces consolidated summary.
-
----
-
-## What it does
-
-Input: a Bulgarian fakтура or приемно-предавателен протокол, in any of these forms — PDF (born-digital or scanned), JPG, PNG, TIFF, BMP, WEBP.
-
-Output:
-- **Excel file** with structured sheets: invoice header, line items, VAT breakdown, audit metadata
-- **Canonical JSON** matching the `InvoiceData` Pydantic schema (19 typed fields)
-- **Validation report**: ЕИК/ПИК format, IBAN checksum, math cross-checks (line totals, VAT, payment math)
-- **Registry update**: per-supplier database that auto-corrects known-good fields on subsequent invoices
-
-What makes it different from generic OCR pipelines:
-
-1. **Vision-LLM first**, not generic OCR. Gemini 2.5 Flash with Pydantic structured output reads the document as an invoice, not as pixels — so numbers are preserved exact, decimal separators don't drift, columns stay aligned.
-2. **Per-client learning**, like Controlisy. Once a human corrects the IBAN of supplier X, every future invoice from X is auto-corrected silently. The OCR engine is replaceable; the registry is the moat.
-3. **Math validation always runs**, regardless of which extractor produced the numbers. Σ(line items) = net amount; net + VAT = total; total − paid = remaining. Failures flag the document for human review automatically.
-4. **Graceful fallback chain**: when Gemini is unavailable (503, free-tier quota), system falls through to pdfplumber (born-digital PDF) or EasyOCR+img2table (image). Output quality drops but the pipeline never crashes.
+Създаден като лек инструмент за счетоводители, малки фирми и офис служители, които искат „качвам фактура и работи" без да настройват AI инфраструктура.
 
 ---
 
-## Architecture
+## Какво прави DocFlow
 
-```
-                    ┌─────────────┐
-   input file  ─→   │  pipeline   │
-                    └──────┬──────┘
-                           │
-        ┌──────────────────┼──────────────────┐
-        ▼                  ▼                  ▼
-  ┌──────────┐      ┌─────────────┐    ┌─────────────────┐
-  │  Gemini  │      │  pdfplumber │    │  EasyOCR +      │
-  │  vision  │      │  (PDF text) │    │  img2table      │
-  └────┬─────┘      └──────┬──────┘    └────────┬────────┘
-       │                   │                    │
-       ▼ InvoiceData       ▼ tables             ▼ tables
-  ┌─────────────────────────────────────────────────────┐
-  │  text_parser    (fills minimal InvoiceData          │
-  │                  if extractor produced none)        │
-  └────────────────────────┬────────────────────────────┘
-                           │
-                           ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  SupplierRegistry.enrich()                          │
-  │  registry-known fields override extraction          │
-  │  (name, address, vat, IBAN, bank, BIC)              │
-  └────────────────────────┬────────────────────────────┘
-                           │
-                           ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  validators.validate()                              │
-  │  • ЕИК format (9/10/13 digits)                      │
-  │  • IBAN length + mod-97 checksum                    │
-  │  • Math: Σlines = net, subtotal − disc = net,       │
-  │    net + VAT = total, total − paid = remaining      │
-  └────────────────────────┬────────────────────────────┘
-                           │
-                           ▼
-  ┌─────────────────────────────────────────────────────┐
-  │  output.write_excel() — invoice/line_items/vat/_meta│
-  │  SupplierRegistry.record() — fill missing, count++  │
-  └─────────────────────────────────────────────────────┘
-```
+- Качваш **PDF, JPG, PNG, TIF** или цяла папка с фактури.
+- AI модел чете документа и извлича: доставчик, ЕИК, ИН по ДДС, IBAN, номер на фактура, дата, цена без ДДС, ДДС, обща сума и т.н.
+- Резултатите се показват в таблица и могат да се свалят като **Excel**.
+- Можеш да избереш кой AI модел да ползваш според това какво ти трябва — бързо, точно или специализирано за таблици.
 
-Trust order, highest to lowest:
-1. **Registry** — facts verified by past human review
-2. **Gemini typed extraction** — high-confidence structured output
-3. **Regex on raw text** — only unambiguous patterns (IBAN with checksum, labeled invoice number); never party identification
+## Поддържани типове фактури
 
----
+DocFlow е тестван и работи добре с:
 
-## Quick start
+- **Български стандартни фактури** — типови формати от ERP системи, счетоводни програми, онлайн магазини.
+- **Скенирани фактури** — снимки или сканове на хартиени документи (по-точна работа с модела „Qwen 3 VL 235B").
+- **PDF с гъсти таблици** — фактури с дълги списъци артикули (по-силен резултат с „Mistral OCR").
+- **Чуждестранни фактури (SaaS)** — DocFlow има правила за разпознаване на популярни SaaS доставчици като GitHub, Canva, Microsoft, OpenAI, Anthropic, Google и Stripe. Системата ги класифицира като чуждестранни и не очаква БГ ЕИК/IBAN.
+
+DocFlow **не подменя** ръчния преглед на счетоводител — той е инструмент за **първа обработка**, който отделя сигурните редове от тези, които изискват внимание.
+
+## Кои AI модели се поддържат
+
+Точно три модела, всеки за различен сценарий:
+
+| Модел | Кога го избираш |
+|---|---|
+| ⭐ **Gemini 3.1 Flash Lite** | Стандартният избор. Бърз и работи добре с типични български фактури. |
+| 🎯 **Qwen 3 VL 235B** | Когато имаш скенирани документи, дребен шрифт или нестандартни формати. |
+
+В локална употреба всеки модел изисква **собствен API ключ** от съответната услуга. DocFlow не препродава достъп — регистрираш се директно при доставчика и плащаш според неговата тарифа.
+
+## Как да добавиш API ключове
+
+### Локално (за разработка)
+
+Създай файл `.env` в корена на проекта:
 
 ```bash
-# 1. Clone, create venv, install
-python3 -m venv .venv
-.venv/bin/pip install -e .
-
-# 2. Configure Gemini API key (free tier from https://aistudio.google.com/apikey)
-echo 'GEMINI_API_KEY=your_key_here' > .env
-chmod 600 .env
-
-# 3. Run on a single document
-.venv/bin/python -m docflow path/to/invoice.pdf
-
-# 4. Batch a folder
-.venv/bin/python -m docflow path/to/invoices/
-
-# Output: output/<name>.xlsx per document, output/_summary.xlsx for batches
+GEMINI_API_KEY=твоят_google_gemini_ключ
+OPENROUTER_API_KEY=твоят_openrouter_ключ
 ```
 
-`registry.db` (SQLite) is created automatically on first invoice with a recognized supplier.
+`.env` е в `.gitignore` — никога няма да се commit-не случайно.
 
-To correct a known supplier's IBAN after a human review:
+**Откъде взимаш ключове:**
 
-```python
-from docflow.registry import SupplierRegistry
-SupplierRegistry().correct("9601270035", iban="BG80BNBG96611020345678")
+- **Gemini** → https://aistudio.google.com/apikey (безплатен tier при малки обеми)
+- **OpenRouter** (за Qwen) → https://openrouter.ai/keys (изисква депозит, плаща се per-token)
+
+### Streamlit Cloud (за публичен demo)
+
+Виж [DEPLOY_STREAMLIT_CLOUD.md](DEPLOY_STREAMLIT_CLOUD.md).
+
+## Какво да очакваш от резултатите
+
+В наш тест на **10 реални български фактури от един телеком оператор**:
+
+- **Gemini 3.1 Flash Lite** обработи всичките 10 фактури, разпозна доставчика правилно във всеки случай, отнемаше около 7 секунди на фактура.
+- **Qwen 3 VL 235B** обработи всичките 10, разпозна доставчика правилно във всеки случай, отнемаше около 25 секунди на фактура — по-точен на детайли (например запази типографски кавички).
+
+**Това не е независим бенчмарк** — направен е от нас, на ограничен набор от документи от един доставчик. Резултатите при твоите фактури **могат да варират**, особено ако са от различен формат или сектор. Винаги преглеждай критичните полета ръчно.
+
+## Ограничения
+
+DocFlow е в активна разработка. Към момента:
+
+- **Не подменя счетоводен преглед.** Системата маркира кои редове са OK и кои изискват внимание, но решението за приемане е на потребителя.
+- **Не пази данните си.** Всяка фактура се обработва в момента на качване; резултатите остават само в сесията. След рестарт на приложението изчезват.
+- **Зависи от външни AI услуги.** Ако твоят Gemini/OpenRouter/Mistral ключ е невалиден или услугата е претоварена, файлът ще се маркира с понятна грешка.
+- **Не извлича подписи или печати.** Само текстови полета.
+- **Регистър на доставчиците** все още е експериментален и не е изложен в UI-я (логиката работи вътрешно).
+
+## Локално стартиране
+
+```bash
+# 1. инсталирай deps (Python 3.11+)
+pip install -r requirements.txt
+
+# 2. създай .env с поне един API ключ (виж по-горе)
+
+# 3. стартирай интерфейса
+streamlit run app.py
 ```
 
----
+Отвори http://localhost:8501.
 
-## Tech stack
+## Структура на проекта
 
-| Component | Choice | Why |
-|---|---|---|
-| Schema | Pydantic v2 | Native to Gemini structured output; runtime validation |
-| Vision-LLM | Gemini 2.5 Flash | Cheapest top-tier on document benchmarks; native PDF/image; Cyrillic-strong |
-| Born-digital PDF | pdfplumber | Most accurate text+table extraction from PDFs with text layer |
-| Image OCR fallback | EasyOCR | Cyrillic supported; pure pip install |
-| Table detection (image) | img2table | Auto-detect table structure from image, OCR each cell |
-| Image preprocessing | OpenCV | Upscale + CLAHE + denoise before OCR |
-| Excel output | openpyxl | Direct .xlsx write, Cyrillic-safe |
-| Registry | SQLite | Zero-config, embedded, file-based |
-| Env loading | hand-rolled (`docflow/env.py`) | No dotenv dependency |
+- `app.py` — Streamlit интерфейс
+- `docflow/` — pipeline ядро (extractors, validators, schema, eval framework)
+- `docflow/eval/` — оценка на точността срещу ground-truth данни
+- `tests/test_full_system.py` — пълен test suite (61 теста)
+- `samples/` — примерни фактури за тест
 
-Total runtime dependencies: 7 packages.
+## Тестове
 
----
-
-## What's working (v0.1)
-
-- ✓ Single-document extraction: PDF, JPG, PNG, TIFF, BMP, WEBP
-- ✓ Folder batch processing with `_summary.xlsx`
-- ✓ Gemini structured extraction → 19-field canonical JSON
-- ✓ Math validation (4 cross-checks)
-- ✓ Format validation (ЕИК 9/10/13, IBAN mod-97)
-- ✓ Per-supplier registry (auto-fill missing fields, override on registry mismatch)
-- ✓ Graceful fallback (Gemini 503/quota → pdfplumber → EasyOCR)
-- ✓ Retry with exponential backoff for Gemini server errors
-- ✓ Conservative regex fallback parser (IBAN, invoice number only)
-- ✓ Excel output with separate sheets: invoice / line_items / vat / _meta
-
-## What's planned
-
-- Scanned PDF rendering (PyMuPDF) when Gemini unavailable — currently scanned PDF without Gemini falls through to no extractor
-- Чл. 117 protocols (self-charged VAT) — schema supports, validation rules pending
-- Multi-page invoice testing on real samples
-- CSV / XML export options alongside Excel
-- Registry CLI (list, correct, export) instead of Python API
-- Test suite (pytest)
-- Logging framework (structured logs instead of print)
-- Optional ensemble mode (Gemini + Claude vote on numbers; flag disagreements)
-
----
-
-## File map
-
-```
-docflow/
-├── __main__.py              CLI entry: python -m docflow <path>
-├── cli.py                   Argument parsing, single-file vs batch routing
-├── env.py                   Loads .env into os.environ (shell wins)
-├── pipeline.py              Extractor selection + fallback orchestration
-├── batch.py                 Folder traversal, per-file processing, _summary.xlsx
-├── schema.py                Pydantic models: ExtractedDocument, InvoiceData, Party, LineItem, VatBreakdown
-├── extractors/
-│   ├── __init__.py          Extractor Protocol
-│   ├── gemini_extractor.py  Vision-LLM with structured output
-│   ├── pdfplumber_extractor.py   Born-digital PDF text + tables
-│   └── easyocr_image_extractor.py   img2table + EasyOCR for images
-├── preprocess.py            cv2 image cleanup before OCR
-├── text_parser.py           Conservative regex fallback (IBAN + invoice number only)
-├── registry.py              SupplierRegistry (SQLite) + enrich/record/correct
-├── validators.py            ЕИК / IBAN / math cross-check validation
-└── output.py                Excel writer (invoice / line_items / vat / _meta sheets)
+```bash
+python -m tests.test_full_system
 ```
 
-External:
-- `LESSONS_LEARNED.json` — captured lessons, design principles, bugs caught (machine-readable)
-- `CLAUDE.md` — AI Engineer principles followed during development
-- `pyproject.toml` — declarative deps and entry point
-- `.env` — local secrets (gitignored)
-- `registry.db` — SQLite per-supplier knowledge base (gitignored)
-- `samples/` — input documents (gitignored except .gitkeep)
-- `output/` — Excel results (gitignored except .gitkeep)
+Очаквай 61 PASS (един може да се скипне ако Gemini quota е изчерпана).
 
----
+## Licence
 
-## Cost & quota notes
-
-Gemini 2.5 Flash on free tier: **20 requests/day** per project. Consider:
-- `GEMINI_MODEL=gemini-2.5-flash-lite` in `.env` for higher free quota during dev
-- Paid tier for production (~$0.0003 per typical invoice; 1000 invoices ≈ $0.30)
-
-Cost breakdown per invoice (Gemini 2.5 Flash, paid tier):
-- Input: image (~1500 tokens) + prompt (~250 tokens) → ~$0.000165
-- Output: structured JSON (~500 tokens) → ~$0.000150
-- Total: ~$0.0003 per invoice
-
-Other paths (pdfplumber, EasyOCR+img2table) are free, run locally, no API call.
+Private — за партньорска оценка. Свържи се преди публикуване.

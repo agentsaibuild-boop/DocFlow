@@ -2,7 +2,6 @@ from pathlib import Path
 
 from docflow.extractors import Extractor
 from docflow.extractors.gemini_extractor import GeminiExtractor
-from docflow.extractors.mistral_extractor import MistralExtractor
 from docflow.extractors.openrouter_extractor import OpenRouterExtractor
 from docflow.quality import invoice_quality_coverage, invoice_quality_score
 from docflow.schema import ExtractedDocument, is_useful_invoice
@@ -20,13 +19,15 @@ EXTRACTORS: list[Extractor] = [
         model="qwen/qwen3-vl-235b-a22b-instruct",
         name="qwen_3_vl_235b",
     ),
-    MistralExtractor(),
 ]
 
+# Mistral OCR is intentionally hidden from the public evaluation deployment —
+# we haven't benchmarked it on enough BG invoices to charge evaluators' goodwill
+# (or our spending caps) on an unproven provider. Class and config are kept on
+# disk for easy re-enabling once we have data.
 PROVIDER_ALIASES = {
     "gemini-3.1-flash-lite": "gemini_3.1_flash_lite",
     "qwen-3-vl-235b":        "qwen_3_vl_235b",
-    "mistral":               "mistral_ocr",
 }
 
 # UI/CLI-visible provider list. 'auto' is intentionally NOT exposed — every

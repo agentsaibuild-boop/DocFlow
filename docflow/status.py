@@ -177,16 +177,23 @@ def compute_status(
     """
     if provider_error:
         kind = provider_error_kind or "other"
-        kind_label = {
-            "quota": "квота/503",
-            "auth": "автентикация",
-            "network": "мрежа/timeout",
-            "other": "грешка",
-        }.get(kind, kind)
+        # User-facing labels: plain BG, actionable, no raw error codes in the badge.
+        label_by_kind = {
+            "quota":   "⏳ Моделът е претоварен",
+            "auth":    "🔑 Грешен или липсващ API ключ",
+            "network": "🌐 Проблем с връзката",
+            "other":   "⚠️ Моделът не отговори",
+        }
+        notes_by_kind = {
+            "quota":   "Услугата временно е претоварена. Опитай отново след минута или избери друг модел.",
+            "auth":    "Провери API ключа в .env (или Streamlit secrets). Документът не е обработен.",
+            "network": "Връзката с услугата прекъсна или таймаутна. Опитай отново.",
+            "other":   "Моделът върна неочакван отговор. Опитай отново или избери друг модел.",
+        }
         return StatusResult(
             code="PROVIDER_ERROR",
-            label=f"🔌 Provider ({kind_label})",
-            notes=f"Provider не върна резултат ({kind}). Документът не е тестван: {provider_error[:120]}",
+            label=label_by_kind.get(kind, "⚠️ Моделът не отговори"),
+            notes=notes_by_kind.get(kind, f"Документът не е обработен: {provider_error[:120]}"),
         )
 
     if extraction_error:

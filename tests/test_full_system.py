@@ -81,13 +81,13 @@ def test_schema_imports():
 def test_pipeline_registers_extractors():
     from docflow.pipeline import AVAILABLE_PROVIDERS, EXTRACTORS, PROVIDER_ALIASES
     names = [e.name for e in EXTRACTORS]
-    # Active provider list is intentionally short and focused — only the three
-    # we currently surface in the UI catalog.
+    # Active provider list is intentionally short and focused for the public
+    # evaluation deployment — only the two benchmarked options.
     assert set(PROVIDER_ALIASES) == {
-        "gemini-3.1-flash-lite", "qwen-3-vl-235b", "mistral",
+        "gemini-3.1-flash-lite", "qwen-3-vl-235b",
     }, PROVIDER_ALIASES
     # Removed providers must not leak back via EXTRACTORS or aliases.
-    for removed in ("pdfplumber", "claude", "azure", "gemini_2.5_pro"):
+    for removed in ("pdfplumber", "claude", "azure", "gemini_2.5_pro", "mistral_ocr"):
         assert removed not in names, f"removed extractor present in EXTRACTORS: {removed}"
         assert removed not in PROVIDER_ALIASES, f"removed alias still registered: {removed}"
     # 'auto' is hidden from the UI surface.
@@ -1067,7 +1067,6 @@ def test_provider_catalog_shows_real_model_names_with_short_descriptions():
     expected_names = {
         "gemini-3.1-flash-lite": "Gemini",
         "qwen-3-vl-235b":        "Qwen",
-        "mistral":               "Mistral",
     }
     for prov, family in expected_names.items():
         prof = get_profile(prov)
@@ -1102,7 +1101,8 @@ def test_provider_catalog_shows_real_model_names_with_short_descriptions():
         f"recommended should be first, got {ordered[0]}"
 
     # Hard cap on the active provider count for now — focused list, not buffet.
-    assert len(PROFILES) == 3, f"expected 3 providers, got {len(PROFILES)}"
+    # Public evaluation deployment surfaces exactly the two benchmarked models.
+    assert len(PROFILES) == 2, f"expected 2 providers, got {len(PROFILES)}"
 
     return f"{len(PROFILES)} models: " + " · ".join(p.display for p in PROFILES)
 
