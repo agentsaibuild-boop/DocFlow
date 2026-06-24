@@ -1335,6 +1335,104 @@ def test_eval_regression_diff_surfaces_deltas():
     return "deltas surface in diff"
 
 
+def test_custom_api_keys_session_only_no_persistence():
+    """Session-scoped API-key overrides:
+      - off by default → no env mutation
+      - on + values entered → env temporarily overridden, then restored
+      - whitespace-only values ignored (don't override)
+    No keys are written to disk, env outside the with-block, or logs.
+    """
+    import os
+    import app as _app
+
+    # 1. Off → no overrides regardless of provided values.
+    assert _app._resolve_key_overrides({"use_custom_keys": False,
+                                         "custom_gemini_key": "abc"}) == {}
+
+    # 2. On but no values → empty overrides (fallback to env stays).
+    assert _app._resolve_key_overrides({"use_custom_keys": True}) == {}
+
+    # 3. On with both keys present.
+    overrides = _app._resolve_key_overrides({
+        "use_custom_keys": True,
+        "custom_gemini_key": "gem-xyz",
+        "custom_openrouter_key": "sk-or-xyz",
+    })
+    assert overrides == {
+        "GEMINI_API_KEY": "gem-xyz",
+        "OPENROUTER_API_KEY": "sk-or-xyz",
+    }
+
+    # 4. Whitespace-only is treated as not provided.
+    assert _app._resolve_key_overrides({
+        "use_custom_keys": True,
+        "custom_gemini_key": "   ",
+        "custom_openrouter_key": "real",
+    }) == {"OPENROUTER_API_KEY": "real"}
+
+    # Save & restore real env so this test never leaks state to later tests
+    # that rely on the real GEMINI_API_KEY / OPENROUTER_API_KEY from .env.
+    real_g = os.environ.get("GEMINI_API_KEY")
+    real_o = os.environ.get("OPENROUTER_API_KEY")
+    try:
+        # 5. _override_env temporarily sets and then restores exactly. Cover both
+        # the "was set before" and the "was not set before" branches.
+        os.environ["GEMINI_API_KEY"] = "PRE_EXISTING"
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        with _app._override_env({"GEMINI_API_KEY": "TMP_G", "OPENROUTER_API_KEY": "TMP_O"}):
+            assert os.environ["GEMINI_API_KEY"] == "TMP_G"
+            assert os.environ["OPENROUTER_API_KEY"] == "TMP_O"
+        # After exit: restored exactly.
+        assert os.environ["GEMINI_API_KEY"] == "PRE_EXISTING"
+        assert "OPENROUTER_API_KEY" not in os.environ, "must be removed if absent before"
+
+        # 6. No-op when overrides dict is empty.
+        os.environ["GEMINI_API_KEY"] = "STAY"
+        with _app._override_env({}):
+            assert os.environ["GEMINI_API_KEY"] == "STAY"
+        assert os.environ["GEMINI_API_KEY"] == "STAY"
+    finally:
+        # Restore real env exactly.
+        if real_g is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = real_g
+        if real_o is None:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        else:
+            os.environ["OPENROUTER_API_KEY"] = real_o
+
+    return "session-scoped overrides; env restored on exit"
+
+
+def test_custom_api_keys_never_persisted_to_disk_or_logs():
+    """Static regression guard: app.py must not write user keys anywhere
+    persistent and must not print/log them."""
+    src = Path("app.py").read_text(encoding="utf-8")
+
+    # No writes referencing the custom key state-keys.
+    for needle in (
+        ".write_text", ".write_bytes", "open(", "Path(",
+    ):
+        # The first three are dangerous if combined with our key var names;
+        # last is generic. We only care about lines that ALSO mention key state.
+        pass  # checked below with combined assertion
+
+    # The key var names must not co-occur with any write/log call on the same line.
+    forbidden_co_occurrence = ("custom_gemini_key", "custom_openrouter_key")
+    danger_verbs = ("print(", "logger.", "log.", ".write(", ".write_text", ".write_bytes",
+                    "open(", "json.dump", "json.dumps", "yaml.dump", "pickle.dump")
+    for line in src.splitlines():
+        if any(name in line for name in forbidden_co_occurrence):
+            for verb in danger_verbs:
+                assert verb not in line, (
+                    f"key state '{forbidden_co_occurrence}' co-occurs with persist verb "
+                    f"'{verb}' on line: {line.strip()}"
+                )
+
+    return "no persistence path detected"
+
+
 def test_upload_over_limit_blocks_and_does_not_truncate():
     """Batch-size guard must hard-block, not silently truncate. The helpers
     exposed by app.py are the same ones the UI uses."""
@@ -1818,6 +1916,8 @@ TESTS: list[tuple[str, Callable]] = [
     ("eval: aggregate computes critical-field and wrong-but-confident rates", test_eval_aggregate_metrics_critical_and_wbc),
     ("eval: write_all produces json + md + csv + xlsx", test_eval_report_writes_all_four_files),
     ("eval: regression diff surfaces top-line + per-file deltas", test_eval_regression_diff_surfaces_deltas),
+    ("custom keys: session-scoped overrides resolved correctly", test_custom_api_keys_session_only_no_persistence),
+    ("custom keys: no persistence of user-entered API keys", test_custom_api_keys_never_persisted_to_disk_or_logs),
     ("upload: over-limit blocks (no silent truncation)", test_upload_over_limit_blocks_and_does_not_truncate),
     ("upload: app.py contains no silent-truncation slice", test_upload_flow_has_no_silent_truncation),
     ("acceptance: 3 reject-criteria scenarios through real xlsx export", test_reject_criteria_end_to_end_xlsx),

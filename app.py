@@ -43,6 +43,51 @@ from docflow.registry import SupplierRegistry
 from docflow.status import compute_status
 from docflow.validators import validate
 
+from contextlib import contextmanager
+
+
+def _resolve_key_overrides(state) -> dict[str, str]:
+    """Read session-scoped API-key overrides from a Streamlit-like state mapping.
+
+    Returns {} when the user has not opted into custom keys. Keys not provided
+    by the user (or whitespace-only) are omitted so the fallback to env/secrets
+    stays in effect for that provider.
+    """
+    if not state.get("use_custom_keys"):
+        return {}
+    overrides: dict[str, str] = {}
+    gemini = (state.get("custom_gemini_key") or "").strip()
+    openrouter = (state.get("custom_openrouter_key") or "").strip()
+    if gemini:
+        overrides["GEMINI_API_KEY"] = gemini
+    if openrouter:
+        overrides["OPENROUTER_API_KEY"] = openrouter
+    return overrides
+
+
+@contextmanager
+def _override_env(vars_dict: dict[str, str]):
+    """Temporarily set environment variables for the duration of a block.
+
+    Used to inject session-scoped API keys into os.environ around the
+    extraction call so extractors keep reading from os.environ unchanged.
+    Values are restored exactly to their prior state on exit (including
+    being removed if they didn't exist before).
+    """
+    saved: dict[str, str | None] = {}
+    try:
+        for k, v in vars_dict.items():
+            saved[k] = os.environ.get(k)
+            os.environ[k] = v
+        yield
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+
+
 st.set_page_config(page_title="DocFlow", page_icon="📄", layout="wide")
 st.title("📄 DocFlow")
 st.caption("Извличане на данни от български фактури в табличен вид")
@@ -50,6 +95,36 @@ st.caption("Извличане на данни от български факт�
 
 with st.sidebar:
     st.header("⚙️ Настройки")
+
+    # ─── API key режим ──────────────────────────────────────────────────
+    # Session-scoped overrides. Keys never leave st.session_state — no file,
+    # database, logs, or repo persistence; cleared automatically on session end.
+    st.subheader("🔑 API режим")
+    use_custom_keys = st.checkbox(
+        "Use my own API keys",
+        value=st.session_state.get("use_custom_keys", False),
+        key="use_custom_keys",
+    )
+    if use_custom_keys:
+        st.text_input(
+            "Gemini API key",
+            type="password",
+            key="custom_gemini_key",
+            help="Пази се само в текущата сесия; не се записва никъде.",
+        )
+        st.text_input(
+            "OpenRouter API key",
+            type="password",
+            key="custom_openrouter_key",
+            help="Пази се само в текущата сесия; не се записва никъде.",
+        )
+    else:
+        st.caption(
+            "Демо версията позволява ограничен брой опити на ден. "
+            "За пълно тестване включи „Use my own API keys” и въведи своите."
+        )
+
+    st.divider()
 
     providers_status = list_providers()
     available_only = [alias for alias, ok, _ in providers_status if ok]
@@ -274,7 +349,7 @@ with tab_upload:
 
     if mode == "📤 Качи файлове":
         uploaded_files = st.file_uploader(
-            "PDF, JPG, PNG (избери един или много)",
+            "Изберете един или повече файлове с фактури (PDF, JPG, PNG, WEBP, TIF, BMP)",
             accept_multiple_files=True,
             type=["pdf", "jpg", "jpeg", "png", "webp", "tif", "tiff", "bmp"],
             label_visibility="collapsed",
@@ -350,6 +425,26 @@ with tab_upload:
                         for f in files
                     ]
 
+    # ─── Demo / API banner ─────────────────────────────────────────────
+    # Visible immediately on first load, directly under the upload area.
+    # Bordered container is dark-theme aware via Streamlit's native theme.
+    with st.container(border=True):
+        st.markdown("**🔑 Demo mode** · **Демо режим**")
+        st.markdown(
+            "Демо версията позволява ограничен брой опити на ден чрез нашите "
+            "API ключове. За пълно тестване отвори страничния панел → "
+            "„🔑 API режим” → включи „Use my own API keys” и въведи свои "
+            "Gemini / OpenRouter ключове. Ключовете остават само в текущата "
+            "сесия и не се записват никъде."
+        )
+        st.markdown(
+            "_The public demo runs on our limited API keys with a daily cap. "
+            "For unrestricted testing, open the left sidebar → „🔑 API режим” → "
+            "enable „Use my own API keys” and paste your own Gemini / "
+            "OpenRouter keys. They stay in this session only and are never "
+            "written to disk, logs, or repository._"
+        )
+
     process_btn = st.button(
         "🚀 Обработи",
         type="primary",
@@ -359,7 +454,8 @@ with tab_upload:
 
     if process_btn and file_sources:
         registry = SupplierRegistry()
-        results = process_files(file_sources, registry, provider, allow_fallback)
+        with _override_env(_resolve_key_overrides(st.session_state)):
+            results = process_files(file_sources, registry, provider, allow_fallback)
         st.session_state["last_results"] = results
 
         summary = summarize_batch(results)
@@ -380,6 +476,22 @@ with tab_upload:
                 "или включи fallback от sidebar-а."
             )
         st.success("✅ Обработено. Виж раздел **Резултати** за детайли.")
+
+    # ─── Accessibility info ───────────────────────────────────────────
+    # Visible in the main page (not behind a sidebar expander) so screen-reader
+    # users and EU evaluators can find it without exploring widgets.
+    with st.container(border=True):
+        st.markdown("**♿ Accessibility · Достъпност**")
+        st.markdown(
+            "Приложението използва текстови етикети, описателни инструкции и "
+            "стандартни Streamlit контроли, за да бъде по-достъпно за "
+            "потребители със screen reader."
+        )
+        st.markdown(
+            "_The application uses text labels, descriptive instructions, and "
+            "standard Streamlit controls to improve accessibility for screen "
+            "reader users._"
+        )
 
 
 with tab_results:
