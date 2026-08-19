@@ -5,6 +5,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+from docflow.line_items import LINE_ITEM_HEADERS, VAT_HEADERS, iter_line_item_rows, iter_vat_rows
 from docflow.pipeline import NoExtractorFound, ProviderError, extract
 from docflow.registry import SupplierRegistry
 from docflow.schema import ExtractedDocument
@@ -193,17 +194,12 @@ def write_consolidated(results: list[BatchResult], output_path: Path) -> None:
         cell.font = bold
 
     items_sheet = wb.create_sheet("Артикули")
-    items_sheet.append([
-        "Файл", "Доставчик", "Номер фактура",
-        "№", "Описание", "К-во", "ME",
-        "Ед. цена", "Отстъпка %", "Цена с отст.",
-        "ДДС %", "ДДС", "Общо без ДДС",
-    ])
+    items_sheet.append(LINE_ITEM_HEADERS)
     for cell in items_sheet[1]:
         cell.font = bold
 
     vat_sheet = wb.create_sheet("ДДС")
-    vat_sheet.append(["Файл", "Доставчик", "Номер фактура", "Ставка %", "Основа", "ДДС"])
+    vat_sheet.append(VAT_HEADERS)
     for cell in vat_sheet[1]:
         cell.font = bold
 
@@ -236,19 +232,11 @@ def write_consolidated(results: list[BatchResult], output_path: Path) -> None:
                 "",
             ])
 
-            for li in (inv.line_items or []):
-                items_sheet.append([
-                    r.source.name, inv.supplier.name, inv.invoice_number,
-                    li.number, li.description, li.quantity, li.unit,
-                    li.unit_price, li.discount_percent, li.price_after_discount,
-                    li.vat_percent, li.vat_amount, li.total_without_vat,
-                ])
+            for row in iter_line_item_rows([r]):
+                items_sheet.append(row)
 
-            for v in (inv.vat_breakdown or []):
-                vat_sheet.append([
-                    r.source.name, inv.supplier.name, inv.invoice_number,
-                    v.rate_percent, v.base_amount, v.vat_amount,
-                ])
+            for row in iter_vat_rows([r]):
+                vat_sheet.append(row)
 
         for f in r.enrich_findings:
             val_sheet.append([r.source.name, "registry_enrich", f.level, f.code, f.message])

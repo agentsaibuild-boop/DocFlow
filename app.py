@@ -34,7 +34,17 @@ _hydrate_env_from_streamlit_secrets()
 from docflow.batch import BatchResult, summarize_batch
 from docflow.columns import COLUMN_CATALOG, get_row_value
 from docflow.eval.benchmarks import BENCHMARKS, get_benchmark
+from docflow.line_items import (
+    LINE_ITEM_HEADERS,
+    VAT_HEADERS,
+    detail_line_item_rows,
+    detail_vat_rows,
+    invoice_review_pairs,
+    iter_line_item_rows,
+    iter_vat_rows,
+)
 from docflow.pipeline import AVAILABLE_PROVIDERS, ProviderError, extract, list_providers
+from docflow.preview import render_preview
 from docflow.provider_catalog import (
     PROFILES, RECOMMENDED_PROVIDER, get_profile, measured_summary,
     options_in_display_order,
@@ -90,7 +100,7 @@ def _override_env(vars_dict: dict[str, str]):
 
 st.set_page_config(page_title="DocFlow", page_icon="📄", layout="wide")
 st.title("📄 DocFlow")
-st.caption("Извличане на данни от български фактури в табличен вид")
+st.caption("Извличане на данни от български фактури в табличен вид — включително артикулите")
 
 
 with st.sidebar:
@@ -198,6 +208,7 @@ with st.sidebar:
             _column_checkbox(k)
 
     st.caption(f"✓ Активни колони: **{len(selected_columns)}**")
+    st.session_state["selected_columns"] = selected_columns
 
     diagnostic_mode = st.toggle(
         "🔧 Диагностичен режим",
@@ -225,9 +236,21 @@ with st.sidebar:
             st.caption(f"   {note}")
 
 
-tab_upload, tab_results, tab_modes = st.tabs(
-    ["📤 Качване", "📊 Резултати", "🤖 Модели"]
+NAV_UPLOAD = "Качване"
+NAV_RESULTS = "Резултати"
+NAV_MODELS = "Модели"
+if st.session_state.pop("_go_results", False):
+    st.session_state["nav"] = NAV_RESULTS
+if "nav" not in st.session_state:
+    st.session_state["nav"] = NAV_UPLOAD
+nav = st.segmented_control(
+    "Раздел",
+    options=[NAV_UPLOAD, NAV_RESULTS, NAV_MODELS],
+    key="nav",
+    label_visibility="collapsed",
 )
+if nav is None:
+    nav = NAV_UPLOAD
 
 
 MAX_PARALLEL = 5
@@ -260,9 +283,10 @@ def _folder_over_limit_message(file_count: int) -> str:
 def _process_single(name, get_bytes, get_path, provider, allow_fallback):
     """Worker: runs in thread, no Streamlit calls.
 
-    Returns ("ok", name, doc, None, None, None)  on success
-         or ("provider", name, None, None, kind, msg) for provider/transport failures
-         or ("err", name, None, msg, None, None)      for other exceptions
+    Returns ("ok", name, doc, None, None, None, preview)  on success
+         or ("provider", name, None, None, kind, msg, preview)
+         or ("err", name, None, msg, None, None, preview)
+    Preview is PNG bytes of the first page (or None).
     """
     tmp_path = get_path()
     cleanup = False
@@ -271,28 +295,33 @@ def _process_single(name, get_bytes, get_path, provider, allow_fallback):
             tf.write(get_bytes())
             tmp_path = Path(tf.name)
         cleanup = True
+    preview = render_preview(path=tmp_path)
     try:
         doc = extract(tmp_path, provider=provider, allow_fallback=allow_fallback)
         doc.source_path = name
-        return ("ok", name, doc, None, None, None)
+        return ("ok", name, doc, None, None, None, preview)
     except ProviderError as pe:
         # Pass through with the tmp path masked; status.py decides what reaches
         # the UI based on the kind. One UI-safe layer (status.py), not two.
         msg = str(pe).replace(str(tmp_path), name)
-        return ("provider", name, None, None, pe.kind, msg)
+        return ("provider", name, None, None, pe.kind, msg, preview)
     except Exception as e:
         msg = str(e).replace(str(tmp_path), name)
-        return ("err", name, None, f"{type(e).__name__}: {msg}", None, None)
+        return ("err", name, None, f"{type(e).__name__}: {msg}", None, None, preview)
     finally:
         if cleanup:
             tmp_path.unlink(missing_ok=True)
 
 
 def process_files(file_sources, registry, provider, allow_fallback):
-    """file_sources: list of (display_name, get_bytes_callable, source_path_callable)."""
+    """file_sources: list of (display_name, get_bytes_callable, source_path_callable).
+
+    Returns (results, previews) where previews maps file name → PNG bytes.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     results: list[BatchResult] = []
+    previews: dict[str, bytes] = {}
     progress = st.progress(0, text="Подготовка...")
     completed = 0
     total = len(file_sources)
@@ -313,7 +342,9 @@ def process_files(file_sources, registry, provider, allow_fallback):
     name_to_order = {(name): i for i, (name, _, _) in enumerate(file_sources)}
     pending_results.sort(key=lambda r: name_to_order.get(r[1], 999999))
 
-    for status, name, doc, err, perr_kind, perr_msg in pending_results:
+    for status, name, doc, err, perr_kind, perr_msg, preview in pending_results:
+        if preview:
+            previews[name] = preview
         if status == "provider":
             results.append(BatchResult(
                 Path(name), None, None, None, [], [], [],
@@ -334,10 +365,10 @@ def process_files(file_sources, registry, provider, allow_fallback):
         ))
 
     progress.progress(1.0, text=f"Готово: {len(results)} файла")
-    return results
+    return results, previews
 
 
-with tab_upload:
+if nav == NAV_UPLOAD:
     mode = st.radio(
         "Източник на фактурите",
         ["📤 Качи файлове", "📁 Папка от път"],
@@ -455,27 +486,13 @@ with tab_upload:
     if process_btn and file_sources:
         registry = SupplierRegistry()
         with _override_env(_resolve_key_overrides(st.session_state)):
-            results = process_files(file_sources, registry, provider, allow_fallback)
+            results, previews = process_files(file_sources, registry, provider, allow_fallback)
         st.session_state["last_results"] = results
-
-        summary = summarize_batch(results)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("📥 Обработени", summary["processed"])
-        c2.metric("✅ Извлечени OK", summary["extracted_ok"])
-        c3.metric("⚠️ Validation грешки", summary["validation_errors"])
-        c4, c5, c6 = st.columns(3)
-        c4.metric("⚪ Без данни", summary["no_data"])
-        c5.metric("🔌 Provider грешки", summary["provider_failures"])
-        c6.metric("❌ Други грешки", summary["unknown_errors"])
-
-        if summary["provider_failures"]:
-            st.warning(
-                f"🔌 {summary['provider_failures']} файла не са обработени поради "
-                f"provider грешка (квота/503/auth/мрежа). Те **не са** маркирани "
-                "като лоши документи — просто не са тествани. Пробвай отново "
-                "или включи fallback от sidebar-а."
-            )
-        st.success("✅ Обработено. Виж раздел **Резултати** за детайли.")
+        st.session_state["previews"] = previews
+        if results:
+            st.session_state["selected_invoice"] = results[0].source.name
+        st.session_state["_go_results"] = True
+        st.rerun()
 
     # ─── Accessibility info ───────────────────────────────────────────
     # Visible in the main page (not behind a sidebar expander) so screen-reader
@@ -494,7 +511,7 @@ with tab_upload:
         )
 
 
-with tab_results:
+elif nav == NAV_RESULTS:
     if "last_results" not in st.session_state:
         st.info("Качи и обработи фактури в раздел **Качване**.")
     else:
@@ -503,6 +520,19 @@ with tab_results:
         label_for = {k: lbl for k, lbl, _, _ in COLUMN_CATALOG}
 
         import pandas as pd
+
+        summary = summarize_batch(results)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Обработени", summary["processed"])
+        c2.metric("Извлечени OK", summary["extracted_ok"])
+        c3.metric("Validation грешки", summary["validation_errors"])
+        if summary["provider_failures"]:
+            st.warning(
+                f"{summary['provider_failures']} файла не са обработени поради "
+                "грешка на модела (квота, връзка или ключ). "
+                "Документите не са лоши — опитай отново или избери друг модел."
+            )
+
         rows = []
         for r in results:
             row = {"Файл": r.source.name}
@@ -549,9 +579,16 @@ with tab_results:
             rows.append(row)
 
         df = pd.DataFrame(rows)
-        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        items_rows = iter_line_item_rows(results)
+        vat_rows = iter_vat_rows(results)
+        items_df = pd.DataFrame(items_rows, columns=LINE_ITEM_HEADERS)
+        vat_df = pd.DataFrame(vat_rows, columns=VAT_HEADERS)
+
         xlsx_buf = io.BytesIO()
-        df.to_excel(xlsx_buf, index=False, sheet_name="Фактури")
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Фактури")
+            items_df.to_excel(writer, index=False, sheet_name="Артикули")
+            vat_df.to_excel(writer, index=False, sheet_name="ДДС")
 
         st.download_button(
             "⬇️ Свали Excel",
@@ -560,11 +597,91 @@ with tab_results:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
+        st.caption(
+            f"Excel: **Фактури**, **Артикули** ({len(items_rows)} реда), **ДДС**."
+        )
 
-        st.subheader(f"Преглед — {len(selected)} избрани колони")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        names = [r.source.name for r in results]
+        if not names:
+            st.info("Няма резултати.")
+        else:
+            current = st.session_state.get("selected_invoice")
+            if current not in names:
+                st.session_state["selected_invoice"] = names[0]
+            chosen = st.selectbox(
+                "Фактура за преглед",
+                options=names,
+                key="selected_invoice",
+            )
+            chosen_result = next(r for r in results if r.source.name == chosen)
 
-        with st.expander("🔍 Validation проблеми (детайли)"):
+            col_orig, col_fields = st.columns(2, gap="large")
+            with col_orig:
+                st.subheader("Оригинал")
+                preview = (st.session_state.get("previews") or {}).get(chosen)
+                if preview:
+                    st.image(preview, width="stretch")
+                else:
+                    st.caption("Няма преглед за този файл.")
+
+            with col_fields:
+                st.subheader("Извлечени полета")
+                if chosen_result.provider_error or chosen_result.error:
+                    status = compute_status(
+                        None, [],
+                        provider_error=chosen_result.provider_error,
+                        provider_error_kind=chosen_result.provider_error_kind,
+                        extraction_error=chosen_result.error,
+                    )
+                    st.error(status.label)
+                    st.caption(status.notes)
+                else:
+                    status = compute_status(
+                        chosen_result.doc,
+                        chosen_result.validation_findings,
+                        required_column_keys=selected,
+                    )
+                    st.markdown(f"**{status.label}**")
+                    if status.notes:
+                        st.caption(status.notes)
+                    pairs = invoice_review_pairs(
+                        chosen_result.doc,
+                        validation_findings=chosen_result.validation_findings,
+                        registry_findings=chosen_result.registry_findings,
+                    )
+                    st.dataframe(
+                        pd.DataFrame(pairs, columns=["Поле", "Стойност"]),
+                        width="stretch",
+                        hide_index=True,
+                    )
+
+            item_headers, item_detail = detail_line_item_rows(chosen_result)
+            st.subheader(f"Артикули — {len(item_detail)}")
+            if item_detail:
+                st.dataframe(
+                    pd.DataFrame(item_detail, columns=item_headers),
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.info(
+                    "Няма извлечени артикули за тази фактура. "
+                    "Провери дали таблицата със стоки/услуги се вижда на оригинала."
+                )
+
+            vat_headers, vat_detail = detail_vat_rows(chosen_result)
+            if vat_detail:
+                st.subheader("ДДС")
+                st.dataframe(
+                    pd.DataFrame(vat_detail, columns=vat_headers),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        with st.expander("Всички фактури"):
+            st.dataframe(df, width="stretch", hide_index=True)
+
+        with st.expander("Validation проблеми"):
             issues_rows = []
             for r in results:
                 for f in r.validation_findings:
@@ -576,12 +693,12 @@ with tab_results:
                             "Съобщение": f.message,
                         })
             if issues_rows:
-                st.dataframe(pd.DataFrame(issues_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(issues_rows), width="stretch", hide_index=True)
             else:
-                st.success("Няма validation проблеми ✓")
+                st.success("Няма validation проблеми")
 
 
-with tab_modes:
+elif nav == NAV_MODELS:
     st.subheader("🤖 Модели за извличане")
     st.caption(
         "Подкрепени AI модели. Изборът е твой — описанието под всеки казва "
@@ -619,4 +736,4 @@ with tab_modes:
                 "От нашия тест":  measured_summary(prof.provider) or "Все още нямаме достатъчно реални тестове.",
             })
         if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)

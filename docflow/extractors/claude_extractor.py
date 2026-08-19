@@ -9,6 +9,7 @@ import os
 import time
 from pathlib import Path
 
+from docflow.extraction_prompt import LINE_ITEMS_SECTION
 from docflow.schema import ExtractedDocument, ExtractedTable, InvoiceData
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -40,11 +41,10 @@ Examples:
 - ИН по ДДС = OPTIONAL field. Only present if VAT-registered. Format BG + digits. Return null if no VAT line — do NOT fabricate.
 - IBAN = BG + 2 digits + 4 letters + 14 alphanumeric, exactly 22 chars.
 - VAT breakdown rates in Bulgaria: typically 9% or 20%.
-- Capture every row in the goods/services table.
 - Dates: parse from DD.MM.YYYY → YYYY-MM-DD.
 - Return null for fields not present. DO NOT hallucinate.
 - Currency: extract the code shown on the invoice (EUR, BGN, USD, ...). If not stated, return null — do NOT default.
-"""
+""" + LINE_ITEMS_SECTION
 
 
 class ClaudeExtractor:

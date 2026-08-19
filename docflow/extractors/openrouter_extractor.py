@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from docflow.extraction_prompt import LINE_ITEMS_SECTION
 from docflow.schema import ExtractedDocument, ExtractedTable, InvoiceData
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -26,6 +27,8 @@ API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
 PDF_RENDER_DPI = 150
 MAX_PAGES = 5
+# Line-item JSON is bulky; 4096 truncates invoices with more than a handful of rows.
+MAX_OUTPUT_TOKENS = 16384
 
 _PDFIUM_LOCK = threading.Lock()
 
@@ -46,7 +49,7 @@ Field rules:
 - Return null for missing fields. Don't hallucinate.
 
 For non-Bulgarian invoices (US, EU): adapt — use Tax ID for eik, USD/EUR currency, etc.
-"""
+""" + LINE_ITEMS_SECTION
 
 
 class OpenRouterExtractor:
@@ -104,7 +107,7 @@ class OpenRouterExtractor:
             "tools": tools,
             "tool_choice": {"type": "function", "function": {"name": "extract_invoice"}},
             "temperature": 0.0,
-            "max_tokens": 4096,
+            "max_tokens": MAX_OUTPUT_TOKENS,
         }
 
         with httpx.Client(timeout=self._timeout) as client:

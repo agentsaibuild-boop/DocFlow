@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+from docflow.extraction_prompt import LINE_ITEMS_SECTION
 from docflow.schema import ExtractedDocument, ExtractedTable, InvoiceData
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -56,9 +57,8 @@ For invoices NOT in Bulgarian format (e.g. US, EU, UK), capture equivalents:
 
 ═══ COMMON ═══
 
-- For line items, capture every row with quantity, unit, unit price, discount, totals.
 - Return null only when field genuinely absent. DO NOT hallucinate.
-"""
+""" + LINE_ITEMS_SECTION
 
 
 class GeminiExtractor:

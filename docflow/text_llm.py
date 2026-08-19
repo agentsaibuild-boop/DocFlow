@@ -8,6 +8,7 @@ import os
 import time
 from typing import Final
 
+from docflow.extraction_prompt import LINE_ITEMS_SECTION
 from docflow.schema import InvoiceData
 
 DEFAULT_MODEL: Final[str] = "gemini-2.5-flash-lite"
@@ -31,7 +32,7 @@ The text below was extracted from the document by an OCR or PDF parser. Some fie
   • IBAN = BG + 2 digits + 4 letters + 14 alphanumeric, exactly 22 chars.
   • Dates: parse from DD.MM.YYYY → YYYY-MM-DD.
   • Return null for fields not present. DO NOT hallucinate.
-
+""" + LINE_ITEMS_SECTION + """
 ═══ TEXT FROM DOCUMENT ═══
 """
 

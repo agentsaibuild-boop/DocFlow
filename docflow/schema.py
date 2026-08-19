@@ -21,10 +21,13 @@ class Party(BaseModel):
 
 
 class LineItem(BaseModel):
-    number: int | None = None
-    description: str | None = None
+    number: int | None = Field(default=None, description="Row number from the goods/services table")
+    description: str | None = Field(
+        default=None,
+        description="Full article/service name as printed, including product codes. Do not truncate.",
+    )
     quantity: float | None = None
-    unit: str | None = Field(default=None, description="Unit of measure: бр, кг, м2, дм, etc.")
+    unit: str | None = Field(default=None, description="Unit of measure: бр, кг, м2, дм, hours, pcs, etc.")
     unit_price: float | None = Field(default=None, description="Unit price without VAT")
     discount_percent: float | None = None
     price_after_discount: float | None = None
@@ -46,7 +49,14 @@ class InvoiceData(BaseModel):
     delivery_date: str | None = Field(default=None, description="Дата на предоставяне")
     supplier: Party | None = Field(default_factory=Party, description="Изпълнител")
     customer: Party | None = Field(default_factory=Party, description="Получател")
-    line_items: list[LineItem] | None = Field(default_factory=list)
+    line_items: list[LineItem] | None = Field(
+        default_factory=list,
+        description=(
+            "Every billed goods/services row from the invoice table (Артикули / "
+            "Стоки и услуги). Do not skip, summarise, or omit rows. Exclude only "
+            "header, subtotal, VAT, and payment-info rows."
+        ),
+    )
     subtotal: float | None = Field(default=None, description="Сума без отстъпка")
     discount: float | None = Field(default=None, description="Отстъпка (positive value)")
     net_amount: float | None = Field(default=None, description="Обща нетна сума")

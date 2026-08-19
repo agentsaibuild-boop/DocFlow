@@ -149,6 +149,29 @@ def validate_invoice_math(inv: InvoiceData) -> list[ValidationFinding]:
     return findings
 
 
+def _validate_line_items_present(inv: InvoiceData) -> list[ValidationFinding]:
+    """Warn when the invoice has money but no extracted articles.
+
+    Warning, not error: some lump-sum invoices truly have no item table, and
+    a missing list must not flip the row to VALIDATION_ERROR / cap quality.
+    """
+    items = [
+        li for li in (inv.line_items or [])
+        if (li.description and li.description.strip()) or li.total_without_vat is not None
+    ]
+    if items:
+        return [ValidationFinding(
+            "ok", "line_items_present",
+            f"{len(items)} артикула извлечени",
+        )]
+    if inv.net_amount is not None or inv.total_to_pay is not None:
+        return [ValidationFinding(
+            "warning", "line_items_missing",
+            "Фактурата има сума, но няма извлечени артикули",
+        )]
+    return []
+
+
 def _validate_bank_payment_iban(inv: InvoiceData) -> list[ValidationFinding]:
     """Document-level fact: if the invoice explicitly says bank payment but no
     IBAN was extracted, that's an error regardless of column selection.
@@ -186,6 +209,7 @@ def validate(doc: ExtractedDocument) -> list[ValidationFinding]:
             findings.extend(validate_ibans_in_text(text))
         findings.extend(validate_invoice_math(doc.invoice))
         findings.extend(_validate_bank_payment_iban(doc.invoice))
+        findings.extend(_validate_line_items_present(doc.invoice))
     else:
         findings.extend(validate_eiks_in_text(text))
         findings.extend(validate_ibans_in_text(text))

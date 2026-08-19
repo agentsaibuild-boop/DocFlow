@@ -1846,6 +1846,218 @@ def test_batch_consolidated_structure():
         out.unlink(missing_ok=True)
 
 
+def test_batch_consolidated_writes_line_items():
+    from docflow.batch import write_consolidated, BatchResult
+    from docflow.schema import ExtractedDocument, InvoiceData, LineItem, Party
+    from openpyxl import load_workbook
+
+    inv = InvoiceData(
+        invoice_number="F-9",
+        supplier=Party(name="Доставчик ООД"),
+        line_items=[
+            LineItem(number=1, description="Кабел NYM 3x2.5", quantity=10, unit="м",
+                     unit_price=2.5, total_without_vat=25),
+            LineItem(number=2, description="Конзола", quantity=4, unit="бр",
+                     unit_price=1.2, total_without_vat=4.8),
+        ],
+    )
+    doc = ExtractedDocument(
+        source_path="f.pdf", extraction_method="test", page_count=1, invoice=inv,
+    )
+    results = [BatchResult(Path("f.pdf"), Path("f.xlsx"), doc, None, [], [], [])]
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tf:
+        out = Path(tf.name)
+    try:
+        write_consolidated(results, out)
+        ws = load_workbook(out)["Артикули"]
+        rows = list(ws.iter_rows(min_row=2, values_only=True))
+        assert len(rows) == 2, rows
+        assert rows[0][4] == "Кабел NYM 3x2.5"
+        assert rows[1][4] == "Конзола"
+        return f"{len(rows)} артикула в Excel"
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def test_ui_excel_includes_artikuli_sheet():
+    import io
+
+    import pandas as pd
+    from openpyxl import load_workbook
+
+    from docflow.batch import BatchResult
+    from docflow.line_items import LINE_ITEM_HEADERS, VAT_HEADERS, iter_line_item_rows, iter_vat_rows
+    from docflow.schema import ExtractedDocument, InvoiceData, LineItem, Party, VatBreakdown
+
+    inv = InvoiceData(
+        invoice_number="U-1",
+        supplier=Party(name="X"),
+        line_items=[LineItem(description="Услуга", quantity=1, total_without_vat=100)],
+        vat_breakdown=[VatBreakdown(rate_percent=20, base_amount=100, vat_amount=20)],
+    )
+    results = [BatchResult(
+        Path("u.pdf"), None,
+        ExtractedDocument(source_path="u.pdf", extraction_method="t", page_count=1, invoice=inv),
+        None, [], [], [],
+    )]
+    invoices_df = pd.DataFrame([{"Файл": "u.pdf", "Номер фактура": "U-1"}])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        invoices_df.to_excel(writer, index=False, sheet_name="Фактури")
+        pd.DataFrame(iter_line_item_rows(results), columns=LINE_ITEM_HEADERS).to_excel(
+            writer, index=False, sheet_name="Артикули",
+        )
+        pd.DataFrame(iter_vat_rows(results), columns=VAT_HEADERS).to_excel(
+            writer, index=False, sheet_name="ДДС",
+        )
+    wb = load_workbook(buf)
+    assert wb.sheetnames == ["Фактури", "Артикули", "ДДС"]
+    assert wb["Артикули"]["E2"].value == "Услуга"
+    return "UI workbook has Артикули sheet"
+
+
+def test_line_item_columns_and_status_ignore():
+    from docflow.columns import get_row_value
+    from docflow.schema import ExtractedDocument, InvoiceData, LineItem, Party
+    from docflow.status import INFORMATIONAL_KEYS, compute_status
+
+    inv = InvoiceData(
+        invoice_number="X", issue_date="2026-01-01",
+        supplier=Party(name="БГ ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="Y"),
+        iban="BG80BNBG96611020345678",
+        net_amount=100.0, total_to_pay=120.0,
+        currency="BGN", payment_method="По банка",
+        line_items=[LineItem(description="Тръба", quantity=2, total_without_vat=100)],
+    )
+    doc = ExtractedDocument(source_path="x", extraction_method="t", page_count=1, invoice=inv)
+    assert get_row_value("line_item_count", doc) == 1
+    assert "Тръба" in get_row_value("line_items_summary", doc)
+
+    empty = InvoiceData(
+        invoice_number="X", issue_date="2026-01-01",
+        supplier=Party(name="БГ ООД", eik="123456789", vat_number="BG123456789"),
+        customer=Party(name="Y"),
+        iban="BG80BNBG96611020345678",
+        net_amount=100.0, total_to_pay=120.0,
+        currency="BGN", payment_method="По банка",
+    )
+    empty_doc = ExtractedDocument(
+        source_path="x", extraction_method="t", page_count=1, invoice=empty,
+    )
+    required = ["supplier_name"] + sorted(INFORMATIONAL_KEYS)
+    result = compute_status(empty_doc, [], required_column_keys=required)
+    assert result.code == "OK", result
+    assert get_row_value("line_item_count", empty_doc) == 0
+    assert get_row_value("line_items_summary", empty_doc) == "—"
+    return "count/summary populated; informational keys do not gate status"
+
+
+def test_missing_line_items_is_warning_not_error():
+    from docflow.schema import ExtractedDocument, InvoiceData, Party
+    from docflow.validators import validate
+
+    doc = ExtractedDocument(
+        source_path="x", extraction_method="t", page_count=1,
+        invoice=InvoiceData(
+            invoice_number="1",
+            supplier=Party(name="X", eik="123456789"),
+            net_amount=100, total_to_pay=120,
+        ),
+    )
+    findings = validate(doc)
+    missing = [f for f in findings if f.code == "line_items_missing"]
+    assert len(missing) == 1 and missing[0].level == "warning"
+    assert not any(f.level == "error" and f.code == "line_items_missing" for f in findings)
+
+
+def test_extractors_prompt_for_every_line_item():
+    from docflow.extractors.claude_extractor import EXTRACTION_PROMPT as claude
+    from docflow.extractors.gemini_extractor import EXTRACTION_PROMPT as gemini
+    from docflow.extractors.openrouter_extractor import EXTRACTION_PROMPT as openrouter
+    from docflow.extractors.openrouter_extractor import MAX_OUTPUT_TOKENS
+    from docflow.schema import InvoiceData
+    from docflow.text_llm import EXTRACTION_PROMPT_TEXT as text_llm
+
+    for prompt in (gemini, openrouter, claude, text_llm):
+        assert "line_items" in prompt
+        assert "EVERY" in prompt
+    desc = InvoiceData.model_json_schema()["properties"]["line_items"]["description"]
+    assert "every" in desc.lower() or "Every" in desc
+    assert MAX_OUTPUT_TOKENS >= 8192
+    return f"prompts + schema + max_tokens={MAX_OUTPUT_TOKENS}"
+
+
+def test_preview_renders_sample_jpg():
+    from docflow.preview import render_preview
+    if not SAMPLE_JPG.exists():
+        raise SkipTest(f"missing {SAMPLE_JPG.name}")
+    png = render_preview(path=SAMPLE_JPG)
+    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
+    return f"{len(png)} PNG bytes"
+
+
+def test_preview_renders_sample_pdf():
+    from docflow.preview import render_preview
+    if not SAMPLE_BORN_DIGITAL_PDF.exists():
+        raise SkipTest(f"missing {SAMPLE_BORN_DIGITAL_PDF.name}")
+    png = render_preview(path=SAMPLE_BORN_DIGITAL_PDF)
+    assert png is not None and png[:8] == b"\x89PNG\r\n\x1a\n"
+    return f"{len(png)} PNG bytes"
+
+
+def test_preview_unknown_suffix_returns_none():
+    from docflow.preview import render_preview
+    assert render_preview(data=b"not-an-image", suffix=".txt") is None
+    assert render_preview(path=Path("no_such_file.pdf")) is None
+
+
+def test_invoice_review_pairs_and_detail_rows():
+    from docflow.batch import BatchResult
+    from docflow.line_items import (
+        detail_line_item_rows, invoice_review_pairs, REVIEW_FIELD_KEYS,
+    )
+    from docflow.schema import ExtractedDocument, InvoiceData, LineItem, Party
+
+    inv = InvoiceData(
+        invoice_number="R-1",
+        supplier=Party(name="Демо ООД", eik="123456789"),
+        customer=Party(name="Клиент"),
+        line_items=[
+            LineItem(number=1, description="Кабел", quantity=2, unit="м", total_without_vat=10),
+            LineItem(number=2, description="Конзола", quantity=1, unit="бр", total_without_vat=5),
+        ],
+        net_amount=15, total_to_pay=18, currency="BGN",
+    )
+    doc = ExtractedDocument(source_path="r.pdf", extraction_method="t", page_count=1, invoice=inv)
+    pairs = invoice_review_pairs(doc)
+    labels = [p[0] for p in pairs]
+    assert "Доставчик" in labels and "Номер фактура" in labels
+    assert len(pairs) == len(REVIEW_FIELD_KEYS)
+    values = dict(pairs)
+    assert values["Доставчик"] == "Демо ООД"
+    assert values["Номер фактура"] == "R-1"
+    assert values["Брой артикули"] == 2
+
+    result = BatchResult(Path("r.pdf"), None, doc, None, [], [], [])
+    headers, rows = detail_line_item_rows(result)
+    assert "Описание" in headers
+    assert "Файл" not in headers
+    assert len(rows) == 2
+    assert rows[0][1] == "Кабел"
+    return f"{len(rows)} detail rows"
+
+
+def test_app_switches_to_results_after_process():
+    src = Path("app.py").read_text(encoding="utf-8")
+    assert '_go_results' in src
+    assert 'selected_invoice' in src
+    assert 'Оригинал' in src
+    assert 'Извлечени полета' in src
+    assert "st.tabs(" not in src
+    return "nav switch + review pane present"
+
+
 # 8. Env loader
 def test_env_loader_respects_existing_env():
     from docflow.env import load_env_file
@@ -1933,6 +2145,16 @@ TESTS: list[tuple[str, Callable]] = [
     ("CLI: unsupported extension → exit 1", test_cli_unsupported_extension),
     ("output.write_excel: invoice/line_items/vat/_meta sheets", test_excel_writer_produces_invoice_sheets),
     ("batch.write_consolidated: Фактури/Артикули/ДДС/Validation/_meta structure", test_batch_consolidated_structure),
+    ("batch.write_consolidated writes each артикул row", test_batch_consolidated_writes_line_items),
+    ("UI Excel export includes Артикули sheet", test_ui_excel_includes_artikuli_sheet),
+    ("line_item columns populate; informational keys do not gate status", test_line_item_columns_and_status_ignore),
+    ("missing line items is a warning, not an error", test_missing_line_items_is_warning_not_error),
+    ("extractors + schema require every line item", test_extractors_prompt_for_every_line_item),
+    ("preview: sample JPG becomes PNG", test_preview_renders_sample_jpg),
+    ("preview: sample PDF first page becomes PNG", test_preview_renders_sample_pdf),
+    ("preview: unknown suffix returns None", test_preview_unknown_suffix_returns_none),
+    ("review pane: field pairs + per-invoice артикули", test_invoice_review_pairs_and_detail_rows),
+    ("app switches to results and shows original vs extracted", test_app_switches_to_results_after_process),
     ("env loader: shell wins, file fills gaps", test_env_loader_respects_existing_env),
 ]
 

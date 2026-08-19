@@ -35,6 +35,8 @@ COLUMN_CATALOG = [
     ("due_date",         "Срок плащане",       "Дати",       False),
 
     ("currency",         "Валута",             "Плащане",    True),
+    ("line_item_count",  "Брой артикули",      "Артикули",   True),
+    ("line_items_summary","Артикули",          "Артикули",   True),
     ("subtotal",         "Сума без отстъпка",  "Плащане",    False),
     ("discount",         "Отстъпка",           "Плащане",    False),
     ("payment_method",   "Метод плащане",      "Плащане",    False),
@@ -85,6 +87,16 @@ def get_row_value(field, doc, *, validation_findings=None, registry_findings=Non
         if doc is None or doc.invoice is None:
             return ""
         return ", ".join(doc.invoice.derived_fields)
+    if field == "line_item_count":
+        from docflow.line_items import line_item_count
+        if doc is None:
+            return 0
+        return line_item_count(doc.invoice)
+    if field == "line_items_summary":
+        from docflow.line_items import line_item_summary
+        if doc is None:
+            return "—"
+        return line_item_summary(doc.invoice)
 
     if doc is None or doc.invoice is None:
         return ""

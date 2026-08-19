@@ -4,8 +4,9 @@ A single function decides the per-row status used by both the Streamlit UI and
 the batch xlsx writer. Status is supplier- and payment-method-aware: a missing
 IBAN on a US card-paid invoice is not the same kind of "incomplete" as on a
 Bulgarian bank-transfer invoice. Diagnostic columns (quality_score,
-validation_errors, registry_status, is_derived) are not part of the
-completeness contract — selecting them must not affect status.
+validation_errors, registry_status, is_derived) and informational summaries
+(line_item_count, line_items_summary) are not part of the completeness
+contract — selecting them must not affect status.
 """
 
 from dataclasses import dataclass, field
@@ -22,6 +23,13 @@ DIAGNOSTIC_KEYS = {
     "validation_errors",
     "registry_status",
     "derived_fields",
+}
+
+# Header-table summaries derived from line_items. Selecting them must not
+# mark a row INCOMPLETE — empty articles are a warning, not a missing column.
+INFORMATIONAL_KEYS = {
+    "line_item_count",
+    "line_items_summary",
 }
 
 
@@ -144,9 +152,9 @@ def _vat_required(inv) -> bool:
 def is_column_required_for(key: str, inv) -> bool:
     """Whether the column applies to this invoice's profile.
 
-    Diagnostic keys are never status-relevant. Domain exemptions live here.
+    Diagnostic and informational keys are never status-relevant. Domain exemptions live here.
     """
-    if key in DIAGNOSTIC_KEYS:
+    if key in DIAGNOSTIC_KEYS or key in INFORMATIONAL_KEYS:
         return False
     if key == "supplier_iban":
         return requires_iban(inv)
