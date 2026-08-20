@@ -27,3 +27,13 @@ samples/*
 *.swp
 .DS_Store
 eval_output/
+
+# Local department accounts (password hashes). Never commit.
+users.json
+users.json.bak
+_test_users.json
+
+# Local HR extraction archive (PII). Never commit.
+човешки ресурси/архив/*
+!човешки ресурси/архив/.gitkeep
+човешки ресурси/.qt-libs/

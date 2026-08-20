@@ -81,8 +81,8 @@ def test_schema_imports():
 def test_pipeline_registers_extractors():
     from docflow.pipeline import AVAILABLE_PROVIDERS, EXTRACTORS, PROVIDER_ALIASES
     names = [e.name for e in EXTRACTORS]
-    # Active provider list is intentionally short and focused for the public
-    # evaluation deployment — only the two benchmarked options.
+    # Active provider list from 19 Aug 2026: Gemini Flash Lite (default) + Qwen.
+    assert names[0] == "gemini_3.1_flash_lite", names
     assert set(PROVIDER_ALIASES) == {
         "gemini-3.1-flash-lite", "qwen-3-vl-235b",
     }, PROVIDER_ALIASES
@@ -1100,8 +1100,7 @@ def test_provider_catalog_shows_real_model_names_with_short_descriptions():
     assert ordered[0] == RECOMMENDED_PROVIDER, \
         f"recommended should be first, got {ordered[0]}"
 
-    # Hard cap on the active provider count for now — focused list, not buffet.
-    # Public evaluation deployment surfaces exactly the two benchmarked models.
+    # Focused list from 19 Aug 2026: Gemini Flash Lite + Qwen.
     assert len(PROFILES) == 2, f"expected 2 providers, got {len(PROFILES)}"
 
     return f"{len(PROFILES)} models: " + " · ".join(p.display for p in PROFILES)
@@ -1408,7 +1407,7 @@ def test_custom_api_keys_session_only_no_persistence():
 def test_custom_api_keys_never_persisted_to_disk_or_logs():
     """Static regression guard: app.py must not write user keys anywhere
     persistent and must not print/log them."""
-    src = Path("app.py").read_text(encoding="utf-8")
+    src = Path("app.py").read_text(encoding="utf-8") + "\n" + Path("фактури/invoices.py").read_text(encoding="utf-8")
 
     # No writes referencing the custom key state-keys.
     for needle in (
@@ -1464,7 +1463,7 @@ def test_upload_over_limit_blocks_and_does_not_truncate():
 def test_upload_flow_has_no_silent_truncation():
     """Defence against regression: source must not contain a slice that
     silently trims to MAX_FILES_PER_BATCH."""
-    src = Path("app.py").read_text(encoding="utf-8")
+    src = Path("app.py").read_text(encoding="utf-8") + "\n" + Path("фактури/invoices.py").read_text(encoding="utf-8")
     forbidden = (
         "uploaded_files[:MAX_FILES_PER_BATCH]",
         "files[:MAX_FILES_PER_BATCH]",
@@ -1750,7 +1749,7 @@ def test_pipeline_gemini_path():
 
     from docflow.pipeline import extract
     try:
-        doc = extract(SAMPLE_JPG)
+        doc = extract(SAMPLE_JPG, provider="gemini-3.1-flash-lite")
     except RuntimeError as e:
         if "quota" in str(e).lower() or "503" in str(e):
             raise SkipTest(f"Gemini unavailable: {e}")
@@ -2049,16 +2048,314 @@ def test_invoice_review_pairs_and_detail_rows():
 
 
 def test_app_switches_to_results_after_process():
-    src = Path("app.py").read_text(encoding="utf-8")
-    assert '_go_results' in src
-    assert 'selected_invoice' in src
-    assert 'Оригинал' in src
-    assert 'Извлечени полета' in src
+    src = Path("фактури/invoices.py").read_text(encoding="utf-8")
+    assert "_go_results" in src
+    assert "selected_invoice" in src
+    assert "Оригинал" in src
+    assert "Извлечени полета" in src
     assert "st.tabs(" not in src
     return "nav switch + review pane present"
 
 
-# 8. Env loader
+def test_auth_password_hash_and_login():
+    from docflow.auth import (
+        User, authenticate, hash_password, save_users, verify_password,
+    )
+
+    hashed = hash_password("secret-pass")
+    assert hashed.startswith("pbkdf2_sha256$")
+    assert verify_password("secret-pass", hashed)
+    assert not verify_password("wrong", hashed)
+
+    path = PROJECT_ROOT / "_test_users.json"
+    try:
+        save_users([
+            User("ana", "Ана", "logistics", hashed),
+        ], path)
+        from docflow.auth import load_users
+        users = load_users(path)
+        ok = authenticate("Ana", "secret-pass", users=users)
+        assert ok is not None and ok.department == "logistics"
+        assert authenticate("ana", "secret-pass", users=users, department_id="logistics") is not None
+        assert authenticate("ana", "secret-pass", users=users, department_id="hr") is None
+        assert authenticate("ana", "secret-pass", users=users, department_id="invoices") is None
+        assert authenticate("ana", "wrong", users=users) is None
+        assert authenticate("ana", "secret-pass", users=[]) is None
+    finally:
+        path.unlink(missing_ok=True)
+
+    seed_path = PROJECT_ROOT / "_test_seed_users.json"
+    seed_path.unlink(missing_ok=True)
+    try:
+        from docflow.auth import ensure_users_file, seed_local_users
+        seeded = seed_local_users(seed_path)
+        assert {u.department for u in seeded} == {"logistics", "invoices", "hr"}
+        save_users([User("ana", "Ана", "logistics", hashed)], seed_path)
+        filled = ensure_users_file(seed_path)
+        assert {u.department for u in filled} >= {"logistics", "invoices", "hr"}
+    finally:
+        seed_path.unlink(missing_ok=True)
+    return "hash + login roundtrip"
+
+
+def test_departments_see_only_their_modules():
+    from docflow.org import list_departments, user_can_open
+    ids = [d.id for d in list_departments()]
+    assert ids == ["logistics", "invoices", "hr"]
+    assert user_can_open("logistics", "invoices")
+    assert user_can_open("invoices", "invoices")
+    assert not user_can_open("logistics", "hr_docs")
+    assert not user_can_open("invoices", "hr_docs")
+    assert user_can_open("hr", "hr_docs")
+    assert not user_can_open("hr", "invoices")
+    return "logistics+invoices=scan, hr=hr_docs"
+
+
+def test_app_has_department_login_shell():
+    src = Path("app.py").read_text(encoding="utf-8")
+    board = Path("docflow/web/dashboard.py").read_text(encoding="utf-8")
+    assert "render_public_board" in src
+    assert "authenticate(" in src
+    assert "selected_department" in board
+    assert "Общ дашборд" in board
+    assert 'height=360' in board
+    assert 'height="stretch"' in board
+    assert "vertical_alignment" in board
+    assert 'view"] = "workspace"' in src
+    assert (PROJECT_ROOT / "човешки ресурси" / "hr.py").is_file()
+    assert (PROJECT_ROOT / "човешки ресурси" / "desktop.py").is_file()
+    assert (PROJECT_ROOT / "човешки ресурси" / "старт.py").is_file()
+    assert (PROJECT_ROOT / "фактури" / "invoices.py").is_file()
+    assert 'department == "invoices"' in src
+    return "public board then three project folders"
+
+
+def _load_hr_identity():
+    hr_dir = str(PROJECT_ROOT / "човешки ресурси")
+    if hr_dir not in sys.path:
+        sys.path.insert(0, hr_dir)
+    import identity as hr_identity
+    return hr_identity
+
+
+def test_hr_uses_same_gemini_flash_lite_key():
+    from docflow.extractors.gemini_extractor import GeminiExtractor
+    from docflow.pipeline import EXTRACTORS
+
+    identity = _load_hr_identity()
+    assert identity.HR_API_KEY_ENV == "GEMINI_API_KEY"
+    assert identity.HR_GEMINI_NAME == "gemini_3.1_flash_lite"
+    gemini = next(e for e in EXTRACTORS if e.name == "gemini_3.1_flash_lite")
+    assert isinstance(gemini, GeminiExtractor)
+    assert gemini.api_key_env == "GEMINI_API_KEY"
+    assert gemini._model == "gemini-3.1-flash-lite"
+    src = Path("docflow/extractors/gemini_extractor.py").read_text(encoding="utf-8")
+    assert "def extract_structured(" in src
+    assert "response_schema=schema" in src
+    return "same Gemini 3.1 Flash Lite + GEMINI_API_KEY"
+
+
+def test_hr_identity_schema_and_egn():
+    identity = _load_hr_identity()
+    props = identity.IdentityDocument.model_json_schema()["properties"]
+    for key in ("document_kind", "document_number", "surname", "given_names", "egn", "mrz", "extra_fields", "eye_color", "can"):
+        assert key in props
+    assert "лична карта" in identity.IDENTITY_PROMPT.lower()
+    assert "кирилица" in identity.IDENTITY_PROMPT.lower()
+    assert "обл." in identity.IDENTITY_PROMPT.lower()
+
+    first9 = "750102001"
+    weights = (2, 4, 8, 5, 10, 9, 7, 3, 6)
+    check = sum(int(d) * w for d, w in zip(first9, weights)) % 11
+    if check == 10:
+        check = 0
+    valid = first9 + str(check)
+    assert identity.egn_checksum_ok(valid)
+    assert not identity.egn_checksum_ok(valid[:-1] + ("0" if valid[-1] != "0" else "1"))
+    assert not identity.egn_checksum_ok("123")
+    assert identity.humanize_written("НИКОЛАЙ") == "Николай"
+    assert identity.humanize_written("ИВАН ИВАНОВ") == "Иван Иванов"
+    assert identity.humanize_written("МАРИЯ-ИВАНА") == "Мария-Ивана"
+    assert identity.humanize_written("Николай") == "Николай"
+    assert identity.humanize_written("МИНИСТЕРСТВО НА ВЪТРЕШНИТЕ РАБОТИ", style="sentence") == (
+        "Министерство на вътрешните работи"
+    )
+    titled = identity.build_hr_result("card.jpg", identity.IdentityDocument(
+        surname="ИВАНОВ", given_names="НИКОЛАЙ", egn="7501020010",
+    ))
+    assert titled.doc.surname == "Иванов"
+    assert titled.doc.given_names == "Николай"
+    assert titled.doc.egn == "7501020010"
+    return "id-card schema + ЕГН checksum + written case"
+
+
+def test_hr_identity_excel_and_review():
+    identity = _load_hr_identity()
+    doc = identity.IdentityDocument(
+        document_kind="id_card",
+        surname="Иванов",
+        given_names="Иван",
+        egn="7501020010",
+        extra_fields=[identity.ExtraField(label="Група кръв", value="A+")],
+    )
+    pairs = identity.identity_review_pairs(doc)
+    labels = [label for label, _ in pairs]
+    assert "Фамилия" in labels
+    assert "ЕГН" in labels
+    assert "Цвят на очите" in labels
+    result = identity.build_hr_result("card.jpg", doc)
+    xlsx = identity.identity_to_excel([result])
+    assert xlsx[:2] == b"PK"
+    import io
+    import pandas as pd
+    sheets = pd.read_excel(io.BytesIO(xlsx), sheet_name=None)
+    assert "Документи" in sheets
+    assert "Допълнителни полета" in sheets
+    docs = sheets["Документи"]
+    assert list(docs.columns) == ["Файл", "Поле", "Стойност"]
+    assert list(sheets["Допълнителни полета"].columns) == ["Файл", "Поле", "Стойност"]
+    by_field = dict(zip(docs["Поле"], docs["Стойност"]))
+    assert by_field["Фамилия"] == "Иванов"
+    assert sheets["Допълнителни полета"].iloc[0]["Стойност"] == "A+"
+    src = (PROJECT_ROOT / "човешки ресурси" / "hr.py").read_text(encoding="utf-8")
+    assert "Обработи" in src
+    assert "Запази поправки" in src
+    assert "Копирай всички редове" in src
+    assert "rows_to_clipboard" in src
+    assert "Размени лице и гръб" in src
+    assert "Завърти лице" in src
+    assert "Копирай поле" not in src
+    desktop = (PROJECT_ROOT / "човешки ресурси" / "desktop.py").read_text(encoding="utf-8")
+    assert "PySide6" in desktop
+    assert "Копирай всички редове" in desktop
+    return "excel + streamlit HR workspace"
+
+
+def test_hr_user_friendly_helpers():
+    import shutil
+
+    identity = _load_hr_identity()
+    assert identity.to_bg_date("1990-03-12") == "12.03.1990"
+    assert identity.to_bg_date("1.2.1990") == "01.02.1990"
+    assert identity.normalize_sex("MALE") == "м"
+    assert identity.normalize_sex("Жена") == "ж"
+    assert identity.normalize_sex("M/m") == "м"
+    assert identity.normalize_sex("М/m") == "м"
+    cyr, latin = identity.split_bilingual("София/Sofia")
+    assert cyr == "София" and latin == "Sofia"
+
+    card = identity.build_hr_result(
+        "id.jpg",
+        identity.IdentityDocument(
+            nationality="България/bgr",
+            sex="M/m",
+            extra_fields=[
+                identity.ExtraField(label="Цвят на очите/Color of eyes", value="Пъстри/other"),
+            ],
+            mrz=(
+                "IDBGR6529778844<<<<<<<<<<<<<<<\n"
+                "9207020M3401228BGR9207029360<4\n"
+                "ZAROV<<NIKOLAY<IVANOV<<<<<<<<<<<<"
+            ),
+        ),
+    )
+    assert card.doc.sex == "м"
+    assert card.doc.nationality == "България"
+    assert card.doc.eye_color == "Пъстри"
+    extra_by_label = {item.label: item.value for item in card.extra}
+    assert extra_by_label["Фамилия (латиница)"] == "Zarov"
+    assert extra_by_label["Имена (латиница)"] == "Nikolay"
+    assert extra_by_label["Презиме (латиница)"] == "Ivanov"
+    shown_labels = [row["Поле"] for row in identity.identity_field_rows(card, include_egn_check=False)]
+    assert "MRZ" in shown_labels
+    assert "Цвят на очите" in shown_labels
+
+    front = identity.IdentityDocument(
+        document_kind="id_card",
+        surname="Иванов",
+        given_names="Николай",
+        date_of_birth="1990-03-12",
+        sex="M",
+        date_of_expiry="2001-01-01",
+    )
+    back = identity.IdentityDocument(permanent_address="гр. София, ул. Витоша 1")
+    built = identity.build_hr_result("a.jpg", front)
+    assert built.doc.date_of_birth == "12.03.1990"
+    assert built.doc.sex == "м"
+    assert identity.document_is_expired(built.doc)
+
+    merged = identity.merge_hr_results(
+        identity.build_hr_result("лице.jpg", front),
+        identity.build_hr_result("гръб.jpg", back),
+    )
+    assert merged.doc.surname == "Иванов"
+    assert merged.doc.permanent_address == "гр. София, ул. Витоша 1"
+    assert identity.excel_filename([merged]) == "Николай_Иванов.xlsx"
+
+    edited = identity.apply_field_edits(merged, [
+        {"Поле": "Фамилия", "Стойност": "Петров"},
+        {"Поле": "Цвят на очите", "Стойност": "кафяви"},
+    ])
+    assert edited.doc.surname == "Петров"
+    assert edited.doc.given_names == "Николай"
+    assert edited.doc.eye_color == "кафяви"
+    assert identity.result_matches(edited, "7501") is False
+    with_egn = identity.build_hr_result("x.jpg", identity.IdentityDocument(egn="7501020018"))
+    assert identity.result_matches(with_egn, "7501020018")
+
+    old_dir = identity.ARCHIVE_DIR
+    identity.ARCHIVE_DIR = PROJECT_ROOT / "_test_hr_archive"
+    try:
+        shutil.rmtree(identity.ARCHIVE_DIR, ignore_errors=True)
+        path = identity.save_archive([edited])
+        loaded = identity.load_archive(path)
+        assert loaded[0].doc.surname == "Петров"
+        hits = identity.search_archive("Петров")
+        assert hits
+    finally:
+        shutil.rmtree(identity.ARCHIVE_DIR, ignore_errors=True)
+        identity.ARCHIVE_DIR = old_dir
+
+    props = identity.IdentityDocument.model_json_schema()["properties"]
+    assert "employer_name" in props and "leave_type" in props
+    assert "трудов договор" in identity.IDENTITY_PROMPT.lower()
+    assert "молба за отпуск" in identity.IDENTITY_PROMPT.lower()
+    clip = identity.rows_to_clipboard([
+        {"Поле": "Фамилия", "Стойност": "Иванов"},
+        {"Поле": "Имена", "Стойност": "Николай"},
+    ])
+    assert clip.splitlines() == ["Поле\tСтойност", "Фамилия\tИванов", "Имена\tНиколай"]
+    with_mrz = identity.build_hr_result(
+        "mrz.jpg",
+        identity.IdentityDocument(surname="Заров", egn="9207029360", mrz="IDBGR..."),
+    )
+    shown = identity.identity_field_rows(with_mrz, include_mrz=False, include_egn_check=False)
+    assert "MRZ" not in [row["Поле"] for row in shown]
+    exported = identity.identity_field_rows(with_mrz)
+    assert "MRZ" in [row["Поле"] for row in exported]
+
+    front_only = identity.build_hr_result(
+        "лице.jpg",
+        identity.IdentityDocument(given_names="Николай", surname="Заров"),
+    )
+    back_only = identity.build_hr_result(
+        "гръб.jpg",
+        identity.IdentityDocument(permanent_address="гр. София", mrz="IDBGR"),
+    )
+    ordered_front, ordered_back, swapped = identity.order_front_back(back_only, front_only)
+    assert swapped
+    assert ordered_front.doc.given_names == "Николай"
+    assert ordered_back.doc.mrz == "IDBGR"
+    from PIL import Image
+    import io
+    tall = Image.new("RGB", (80, 160), "white")
+    buf = io.BytesIO()
+    tall.save(buf, format="PNG")
+    upright = Image.open(io.BytesIO(identity.upright_card_preview(buf.getvalue())))
+    assert upright.width >= upright.height
+    return "dates/sex/merge/edit/archive/search"
+
+
 def test_env_loader_respects_existing_env():
     from docflow.env import load_env_file
     with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as tf:
@@ -2155,6 +2452,13 @@ TESTS: list[tuple[str, Callable]] = [
     ("preview: unknown suffix returns None", test_preview_unknown_suffix_returns_none),
     ("review pane: field pairs + per-invoice артикули", test_invoice_review_pairs_and_detail_rows),
     ("app switches to results and shows original vs extracted", test_app_switches_to_results_after_process),
+    ("auth: password hash + login roundtrip", test_auth_password_hash_and_login),
+    ("departments only see their own modules", test_departments_see_only_their_modules),
+    ("app has department login shell", test_app_has_department_login_shell),
+    ("HR uses same Gemini Flash Lite + key", test_hr_uses_same_gemini_flash_lite_key),
+    ("HR identity schema + ЕГН checksum", test_hr_identity_schema_and_egn),
+    ("HR excel + original vs extracted", test_hr_identity_excel_and_review),
+    ("HR user-friendly helpers", test_hr_user_friendly_helpers),
     ("env loader: shell wins, file fills gaps", test_env_loader_respects_existing_env),
 ]
 

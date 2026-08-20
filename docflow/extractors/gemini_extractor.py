@@ -90,7 +90,8 @@ class GeminiExtractor:
             return False
         return bool(os.environ.get(self.api_key_env))
 
-    def extract(self, path: Path) -> ExtractedDocument:
+    def extract_structured(self, path: Path, schema: type, prompt: str):
+        """Same Gemini call as invoices: vision + JSON schema. Schema/prompt vary per project."""
         import time
 
         from google.genai import errors, types
@@ -101,7 +102,7 @@ class GeminiExtractor:
         part = types.Part.from_bytes(data=file_bytes, mime_type=mime)
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=InvoiceData,
+            response_schema=schema,
             temperature=0.0,
         )
 
@@ -114,7 +115,7 @@ class GeminiExtractor:
             try:
                 response = client.models.generate_content(
                     model=self._model,
-                    contents=[part, EXTRACTION_PROMPT],
+                    contents=[part, prompt],
                     config=config,
                 )
                 break
@@ -136,22 +137,25 @@ class GeminiExtractor:
         if response is None:
             raise RuntimeError(f"Gemini unavailable after {max_attempts} attempt(s) (set GEMINI_RETRY_DELAYS to retry, e.g. '5,15')") from last_err
 
-        invoice: InvoiceData | None = getattr(response, "parsed", None)
-        if invoice is None:
+        parsed = getattr(response, "parsed", None)
+        if parsed is None:
             raise RuntimeError(
-                "Gemini returned no parsed InvoiceData — possible safety block, "
+                f"Gemini returned no parsed {schema.__name__} — possible safety block, "
                 "malformed JSON, or unsupported document"
             )
-
-        tables = self._invoice_to_tables(invoice)
         full_text = response.text or ""
         page_count = self._count_pages(path) if path.suffix.lower() == ".pdf" else 1
+        return parsed, full_text, page_count
 
+    def extract(self, path: Path) -> ExtractedDocument:
+        invoice, full_text, page_count = self.extract_structured(
+            path, InvoiceData, EXTRACTION_PROMPT,
+        )
         return ExtractedDocument(
             source_path=str(path),
             extraction_method=f"{self.name}:{self._model}",
             page_count=page_count,
-            tables=tables,
+            tables=self._invoice_to_tables(invoice),
             full_text=full_text,
             invoice=invoice,
         )

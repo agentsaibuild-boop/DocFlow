@@ -47,10 +47,11 @@ def render_preview(
 
 
 def _image_to_png(raw: bytes) -> bytes:
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     im = Image.open(io.BytesIO(raw))
     im.load()
+    im = ImageOps.exif_transpose(im) or im
     if im.mode not in ("RGB", "RGBA"):
         im = im.convert("RGB")
     if im.width > MAX_WIDTH:
